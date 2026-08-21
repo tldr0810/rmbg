@@ -1,5 +1,12 @@
-import { describe, expect, it } from 'vitest';
-import { A2AError, extractImageFromParts, foldA2AResults, safeErrorText, validateA2AUrl } from '../src/worker/a2a';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  A2AError,
+  extractImageFromParts,
+  fetchImageAsDataUrl,
+  foldA2AResults,
+  safeErrorText,
+  validateA2AUrl,
+} from '../src/worker/a2a';
 
 describe('extractImageFromParts', () => {
   it('extracts inline-data image parts', () => {
@@ -190,6 +197,55 @@ describe('validateA2AUrl', () => {
 
   it('allows http and private hosts in development', () => {
     expect(validateA2AUrl('http://localhost:8787/rpc', false, label)).toBe('http://localhost:8787/rpc');
+  });
+});
+
+describe('fetchImageAsDataUrl', () => {
+  const cred = {
+    rpcUrl: 'https://api.manyfold.ai/api/a2a/agents/x/rpc',
+    token: 'nca_secret_token',
+    label: 'Test Agent',
+  };
+
+  const pngResponse = () =>
+    new Response(new Uint8Array([1, 2, 3]), { headers: { 'content-type': 'image/png' } });
+
+  let calls: Array<{ url: string; headers: Record<string, string> }>;
+
+  beforeEach(() => {
+    calls = [];
+    vi.stubGlobal('fetch', (url: string, init: RequestInit) => {
+      calls.push({ url, headers: (init.headers ?? {}) as Record<string, string> });
+      return Promise.resolve(pngResponse());
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('sends the bearer token when the artifact is on the agent host', async () => {
+    const result = await fetchImageAsDataUrl('https://api.manyfold.ai/artifacts/1.png', {
+      cred,
+      production: true,
+    });
+    expect(result.mimeType).toBe('image/png');
+    expect(calls[0].headers.authorization).toBe(`Bearer ${cred.token}`);
+  });
+
+  it('withholds the bearer token from any other host', async () => {
+    await fetchImageAsDataUrl('https://attacker.example/collect.png', { cred, production: true });
+    expect(calls[0].headers.authorization).toBeUndefined();
+  });
+
+  it.each([
+    'https://169.254.169.254/latest/meta-data',
+    'https://127.0.0.1/artifact.png',
+    'http://api.manyfold.ai/artifact.png',
+    'not a url',
+  ])('rejects %s in production without fetching', async (url) => {
+    await expect(fetchImageAsDataUrl(url, { cred, production: true })).rejects.toThrow(A2AError);
+    expect(calls).toHaveLength(0);
   });
 });
 

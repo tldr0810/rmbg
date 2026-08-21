@@ -128,7 +128,10 @@ Do not return SVG, JSON, a polygon, or a textual explanation.`,
             let finalMime = snapshot.image.mimeType || 'image/png';
 
             if (/^https?:\/\//i.test(snapshot.image.data)) {
-              const fetched = await fetchImageAsDataUrl(snapshot.image.data, cred.token);
+              const fetched = await fetchImageAsDataUrl(snapshot.image.data, {
+                cred,
+                production: env.ENVIRONMENT === 'production',
+              });
               cutoutDataUrl = fetched.dataUrl;
               finalMime = fetched.mimeType || finalMime;
             } else if (snapshot.image.data.startsWith('data:')) {

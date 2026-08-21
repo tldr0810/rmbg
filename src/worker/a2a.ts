@@ -515,14 +515,33 @@ export function snapshotFrom(accumulator: StreamAccumulator): StreamSnapshot {
   };
 }
 
-/** Server-side fetch helper to convert an image URL returned by an agent into a data URL */
+/** Same host, ignoring scheme and port — the test for "may this URL see the token?". */
+function sameHost(a: string, b: string): boolean {
+  try {
+    return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Server-side fetch helper to convert an image URL returned by an agent into a data URL.
+ *
+ * The URL arrives inside the agent's stream, so it is untrusted input: it goes through
+ * `validateA2AUrl` like every other agent-supplied URL (invariant 6). The bearer token
+ * rides along only when the artifact lives on the agent's own host — otherwise a single
+ * crafted artifact URL would hand the token to an arbitrary server. Cross-origin
+ * redirects drop `Authorization` per the Fetch spec, so following them stays safe.
+ */
 export async function fetchImageAsDataUrl(
-  url: string,
-  token?: string,
+  rawUrl: string,
+  options: { cred: AgentCredential; production: boolean },
 ): Promise<{ dataUrl: string; mimeType: string }> {
+  const { cred, production } = options;
+  const url = validateA2AUrl(rawUrl, production, 'the image artifact URL');
   const headers: Record<string, string> = {};
-  if (token) {
-    headers['authorization'] = `Bearer ${token}`;
+  if (sameHost(url, cred.rpcUrl)) {
+    headers['authorization'] = `Bearer ${cred.token}`;
   }
   const response = await fetchTimeout(url, { method: 'GET', headers }, 20_000);
   if (!response.ok) {
