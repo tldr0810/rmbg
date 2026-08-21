@@ -4,6 +4,7 @@ import type { Env } from '../src/worker/types';
 import { handleRemoveBg } from '../src/worker/remove-bg';
 import * as connectModule from '../src/worker/connect';
 import * as a2aModule from '../src/worker/a2a';
+import { CUTOUT_PNG_BASE64 } from './fixtures';
 
 let mockDbStore: Record<string, string> = {};
 
@@ -198,7 +199,7 @@ describe('/api/settings and Cloudflare R2 endpoints', () => {
       },
       image: {
         mimeType: 'image/png',
-        data: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        data: `data:image/png;base64,${CUTOUT_PNG_BASE64}`,
       },
     });
 

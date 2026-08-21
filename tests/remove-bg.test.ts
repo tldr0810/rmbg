@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { handleRemoveBg } from '../src/worker/remove-bg';
+import { assertUsableCutout, handleRemoveBg, pngDimensions } from '../src/worker/remove-bg';
 import type { Env } from '../src/worker/types';
 import app from '../src/worker/index';
 import * as connectModule from '../src/worker/connect';
 import * as a2aModule from '../src/worker/a2a';
+import { CUTOUT_PNG_BASE64, PLACEHOLDER_1X1_BASE64 } from './fixtures';
 
 const mockDb = {
   prepare: () => ({
@@ -91,7 +92,7 @@ describe('remove-bg handler', () => {
       },
       image: {
         mimeType: 'image/png',
-        data: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        data: `data:image/png;base64,${CUTOUT_PNG_BASE64}`,
       },
     });
 
@@ -145,5 +146,51 @@ describe('remove-bg handler', () => {
     await expect(handleRemoveBg(mockEnv, { image: 'data:image/png;base64,abc' })).rejects.toThrow(
       'Manyfold Agent ("Test Agent") 未回傳圖片結果'
     );
+  });
+});
+
+describe('assertUsableCutout', () => {
+  const PLACEHOLDER_1X1 = PLACEHOLDER_1X1_BASE64;
+
+  /** A real PNG of the given size, big enough to clear both thresholds. */
+  const pngOf = (width: number, height: number): string => {
+    const ihdr = new Uint8Array(24);
+    ihdr.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    new DataView(ihdr.buffer).setUint32(16, width);
+    new DataView(ihdr.buffer).setUint32(20, height);
+    const padded = new Uint8Array(2048);
+    padded.set(ihdr, 0);
+    let binary = '';
+    for (const byte of padded) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  };
+
+  it('rejects the 1x1 placeholder an image-blind agent returns', () => {
+    expect(() => assertUsableCutout(PLACEHOLDER_1X1, 'rmbg')).toThrow('回傳了佔位圖');
+  });
+
+  it('reports the placeholder dimensions so the cause is visible', () => {
+    expect(() => assertUsableCutout(PLACEHOLDER_1X1, 'rmbg')).toThrow('1x1');
+  });
+
+  it('rejects a payload too small to be a cutout regardless of format', () => {
+    expect(() => assertUsableCutout(btoa('tiny'), 'rmbg')).toThrow('回傳了佔位圖');
+  });
+
+  it('rejects data that is not valid base64', () => {
+    expect(() => assertUsableCutout('!!!not base64!!!', 'rmbg')).toThrow('無法解碼');
+  });
+
+  it('accepts a real cutout', () => {
+    expect(() => assertUsableCutout(pngOf(96, 96), 'rmbg')).not.toThrow();
+  });
+
+  it('reads PNG dimensions from the IHDR chunk', () => {
+    const bytes = Uint8Array.from(atob(PLACEHOLDER_1X1), (c) => c.charCodeAt(0));
+    expect(pngDimensions(bytes)).toEqual({ width: 1, height: 1 });
+  });
+
+  it('returns null for anything that is not a PNG', () => {
+    expect(pngDimensions(new Uint8Array(64))).toBeNull();
   });
 });

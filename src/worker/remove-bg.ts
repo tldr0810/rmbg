@@ -24,6 +24,64 @@ export interface RemoveBgResponse {
 
 const REMOVE_BG_TIMEOUT_MS = 180_000;
 
+/** Anything smaller than this is a placeholder, not a cutout. */
+const MIN_CUTOUT_BYTES = 512;
+const MIN_CUTOUT_EDGE = 16;
+
+function extensionFor(mimeType: string): string {
+  const subtype = mimeType.split('/')[1] ?? 'png';
+  return subtype === 'jpeg' ? 'jpg' : subtype.replace(/[^a-z0-9]/gi, '') || 'png';
+}
+
+/** PNG dimensions straight out of the IHDR chunk. Null for anything that is not a PNG. */
+export function pngDimensions(bytes: Uint8Array): { width: number; height: number } | null {
+  const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (bytes.length < 24) return null;
+  for (let i = 0; i < signature.length; i++) {
+    if (bytes[i] !== signature[i]) return null;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return { width: view.getUint32(16), height: view.getUint32(20) };
+}
+
+/**
+ * An agent that never received the image still has to answer something, and in practice
+ * it answers with a 1x1 transparent PNG. That used to sail through as a success: saved to
+ * R2, HTTP 200, an invisible "result" for the user. Catch it here instead.
+ */
+export function assertUsableCutout(base64Data: string, agentName: string): void {
+  let bytes: Uint8Array;
+  try {
+    const binary = atob(base64Data);
+    bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  } catch {
+    throw new HttpError(
+      502,
+      'agent_bad_image',
+      `Manyfold Agent ("${agentName}") 回傳的圖片資料無法解碼。`,
+    );
+  }
+
+  // Dimensions are the real signal. Byte length is only a fallback for formats we cannot
+  // measure — a flat-colour cutout compresses far below any sane byte threshold, so
+  // applying both tests at once would reject perfectly good images.
+  const dimensions = pngDimensions(bytes);
+  const degenerate = dimensions
+    ? dimensions.width < MIN_CUTOUT_EDGE || dimensions.height < MIN_CUTOUT_EDGE
+    : bytes.length < MIN_CUTOUT_BYTES;
+
+  if (degenerate) {
+    const detail = dimensions ? `${dimensions.width}x${dimensions.height}` : `${bytes.length} bytes`;
+    throw new HttpError(
+      502,
+      'agent_placeholder_image',
+      `Manyfold Agent ("${agentName}") 回傳了佔位圖而非去背結果 (${detail})。` +
+        `這通常表示 Agent 沒有收到圖片,或它無法輸出圖片。`,
+    );
+  }
+}
+
 function parseRemoveBgJson(text: string): { label?: string; svgPath?: string; boundingBox?: [number, number, number, number] } {
   let cleaned = text.trim();
   if (cleaned.startsWith('```')) {
@@ -92,21 +150,32 @@ export async function handleRemoveBg(env: Env, body: RemoveBgRequest): Promise<R
                 role: 'user',
                 messageId,
                 parts: [
+                  // A2A 0.3.0 FilePart. NOT `kind: 'inline-data'` — that is the Google
+                  // GenAI SDK's spelling, not a part kind the A2A spec defines, so the
+                  // server dropped it and the agent saw a bare text prompt with no image.
                   {
-                    kind: 'inline-data',
-                    mimeType,
-                    data: base64Data,
+                    kind: 'file',
+                    file: {
+                      name: `input.${extensionFor(mimeType)}`,
+                      mimeType,
+                      bytes: base64Data,
+                    },
                   },
                   {
                     kind: 'text',
-                    text: `Remove the background from the provided image.
+                    text: `Remove the background from the image attached to this message.
 
-Return the edited result as a transparent PNG image artifact.
+The image is attached as a file part on this very message — you already have it. Do not ask
+for it, and do not say it is missing.
 
-Preserve the original subject's pixels, colors, texture, hair, fur, edges, and proportions.
-Do not redraw, regenerate, restyle, crop, or add anything.
-Only remove the background.
-Do not return SVG, JSON, a polygon, or a textual explanation.`,
+Return the result as a transparent PNG image artifact, at the same pixel dimensions as the
+input. Preserve the subject's own pixels, colours, texture, hair, fur, edges and proportions
+exactly. Do not redraw, regenerate, restyle, upscale or crop. Remove only the background.
+
+Never answer with a 1x1 or otherwise blank placeholder image. If you cannot produce a real
+cutout, reply with plain text explaining why — a placeholder is worse than an honest failure.
+
+Do not return SVG, JSON, a polygon, or a description of what you would do.`,
                   },
                 ],
               },
@@ -139,6 +208,9 @@ Do not return SVG, JSON, a polygon, or a textual explanation.`,
             } else {
               cutoutDataUrl = `data:${finalMime};base64,${snapshot.image.data}`;
             }
+
+            // Verify before it reaches R2 — a placeholder must not become a stored "result".
+            assertUsableCutout(cutoutDataUrl.slice(cutoutDataUrl.indexOf(',') + 1), selectedAgent.name);
 
             let r2Info: { r2Key: string; r2Url: string } | null = null;
             if (settings.r2Enabled && env.R2_IMAGE) {
