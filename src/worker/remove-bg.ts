@@ -127,11 +127,16 @@ STEP 3 — turn that flat colour into a real alpha channel, at the original size
   import numpy as np
   src = Image.open('/tmp/input.png').convert('RGB')
   gen = Image.open('/tmp/gen.png').convert('RGB').resize(src.size, Image.LANCZOS)
-  rgb = np.array(gen).astype(np.int16)
-  key = np.array([255, 0, 255])          # match the colour you asked for in step 2
+  rgb = np.array(gen).astype(np.float32)
+  key = np.array([255, 0, 255], dtype=np.float32)   # match the colour you asked for in step 2
   dist = np.abs(rgb - key).sum(axis=2)
   alpha = np.clip((dist - 60) * 4, 0, 255).astype(np.uint8)
-  Image.fromarray(np.dstack([np.array(gen), alpha]), 'RGBA').save('/tmp/output.png')
+  # Semi-transparent edge pixels are an anti-aliased blend of subject and key colour.
+  # Un-mix the key colour back out so the edge doesn't carry a magenta fringe.
+  a = (alpha.astype(np.float32) / 255.0)[..., None]
+  decontam = np.clip((rgb - key * (1 - a)) / np.clip(a, 1e-3, 1), 0, 255)
+  rgb_out = np.where(alpha[..., None] < 255, decontam, rgb).astype(np.uint8)
+  Image.fromarray(np.dstack([rgb_out, alpha]), 'RGBA').save('/tmp/output.png')
   EOF
 
 If PIL or numpy is unavailable, the equivalent with ImageMagick is:
