@@ -523,7 +523,10 @@ export async function handleRemoveBg(
           uploadUrl: `${origin}/api/job/${ticket.jobId}/output`,
           base64Data,
           mimeType,
-          model: settings.bgRemoveModel || 'gemini-3.6-flash',
+          // Fixed, not settings.bgRemoveModel: only an -image model can do the magenta-key
+          // step the agent runs (see GEMINI.md). bgRemoveModel picks the text model for the
+          // legacy direct-API SVG-path fallback below, which is a different job entirely.
+          model: 'gemini-3.1-flash-image',
           r2Enabled: settings.r2Enabled,
           production: env.ENVIRONMENT === 'production',
         };
