@@ -94,69 +94,28 @@ export function bytesToBase64(bytes: Uint8Array): string {
  * The instruction the agent receives. The image also rides along as an A2A FilePart so the
  * agent can *see* it, but seeing it is not enough: it reported it cannot materialise those
  * bytes onto its filesystem, and its card only allows text back. So the real work is done
- * against URLs, and the prompt spells out the commands rather than describing them.
+ * against URLs.
  *
- * Step 2 asks for a flat magenta background rather than transparency on purpose. Asked for
- * transparency directly, the model painted a grey-and-white checkerboard — the *picture* of
- * transparency — as opaque RGB pixels, because an image generator has no alpha channel to
- * write to. A uniform colour is something it can actually produce, and turning one colour
- * into alpha is arithmetic the agent can do exactly.
+ * This used to spell out all four steps in full every call — download, ask the model for
+ * flat magenta, chroma-key with spill suppression, upload — even though the agent's own
+ * standing instructions (GEMINI.md, installed as its `rmbg-background-removal` skill) already
+ * say the same thing. That duplication cost real latency: the agent had to read and reason
+ * over ~60 lines of already-known procedure on every single request. Now the call only carries
+ * what's actually new per request — the three values that change — and trusts the skill for
+ * the rest. If the skill and this prompt ever disagree, the skill (kept at
+ * rmbg-skill/SKILL.md, mirrored to the agent's library) is the one to update.
  */
 function agentInstructions(inputUrl: string, uploadUrl: string, token: string, model: string): string {
-  return `Remove the background from an image. Do the work with shell commands — do not answer from the attached preview alone.
+  return `Use your rmbg-background-removal skill to remove this image's background.
 
-STEP 1 — download the image:
-  curl -sS -o /tmp/input.png '${inputUrl}'
+model: ${model}
+input URL: ${inputUrl}
+upload URL: ${uploadUrl}
+job token: ${token}
 
-STEP 2 — use ${model} to replace the background with flat magenta.
-Send /tmp/input.png to ${model} and ask for the same image with every background pixel
-replaced by solid pure magenta, RGB exactly (255, 0, 255). Save its output as /tmp/gen.png.
-
-  - Do NOT ask for transparency, and do NOT accept a grey-and-white checkerboard. A
-    checkerboard is a drawing of transparency, not transparency, and it will be rejected.
-  - The background must be one flat colour: no gradient, no shadow, no vignette, no texture.
-  - Keep the subject's own pixels: colours, texture, hair, fur, edge detail, proportions.
-    Do not restyle, recolour, crop or recompose the subject.
-  - If the subject itself contains magenta, use solid pure green (0, 255, 0) instead and use
-    that colour in step 3.
-
-STEP 3 — turn that flat colour into a real alpha channel, at the original size:
-
-  python3 - <<'EOF'
-  from PIL import Image
-  import numpy as np
-  src = Image.open('/tmp/input.png').convert('RGB')
-  gen = Image.open('/tmp/gen.png').convert('RGB').resize(src.size, Image.LANCZOS)
-  rgb = np.array(gen).astype(np.float32)
-  key = np.array([255, 0, 255], dtype=np.float32)   # match the colour you asked for in step 2
-  dist = np.abs(rgb - key).sum(axis=2)
-  alpha = np.clip((dist - 60) * 4, 0, 255).astype(np.uint8)
-  # Semi-transparent edge pixels are an anti-aliased blend of subject and key colour.
-  # Un-mix the key colour back out so the edge doesn't carry a magenta fringe.
-  a = (alpha.astype(np.float32) / 255.0)[..., None]
-  decontam = np.clip((rgb - key * (1 - a)) / np.clip(a, 1e-3, 1), 0, 255)
-  rgb_out = np.where(alpha[..., None] < 255, decontam, rgb).astype(np.uint8)
-  Image.fromarray(np.dstack([rgb_out, alpha]), 'RGBA').save('/tmp/output.png')
-  EOF
-
-If PIL or numpy is unavailable, the equivalent with ImageMagick is:
-  convert /tmp/gen.png -resize "$(identify -format '%wx%h!' /tmp/input.png)" \\
-    -fuzz 20% -transparent magenta /tmp/output.png
-If neither tool exists, do not improvise and do not upload — say so in your reply instead.
-
-STEP 4 — upload the result:
-  curl -sS -X PUT --data-binary @/tmp/output.png \\
-    -H 'content-type: image/png' \\
-    -H 'x-job-token: ${token}' \\
-    '${uploadUrl}'
-
-A 200 response means the upload succeeded. Then reply with the single word DONE.
-
-The upload is how the result gets back — your reply text is not the delivery channel, so do
-not paste base64 into it. If any step fails, reply with plain text saying exactly which
-command failed and what it printed. An honest failure is useful; a placeholder image, a 1x1
-PNG, a checkerboard, or the input returned unchanged is worse than nothing and will be
-rejected.`;
+Follow the skill's procedure exactly — do not improvise or skip steps. Reply with the single
+word DONE only after the upload returns 200. If the skill is not installed, or any step fails,
+reply in plain text saying so and naming what failed.`;
 }
 
 /** PNG dimensions straight out of the IHDR chunk. Null for anything that is not a PNG. */
