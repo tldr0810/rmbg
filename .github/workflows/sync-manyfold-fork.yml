@@ -1,0 +1,35 @@
+name: Sync organization fork
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository == 'manyfold-open/rmbg'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward fork from upstream
+        run: |
+          git remote add upstream https://github.com/tldr0810/rmbg.git
+          git fetch --prune upstream main
+          git checkout main
+
+          if ! git merge-base --is-ancestor HEAD upstream/main; then
+            echo "The organization fork has commits that are not in upstream/main."
+            echo "Refusing to overwrite the fork; resolve the divergence before syncing again."
+            exit 1
+          fi
+
+          git merge --ff-only upstream/main
+          git push origin main
