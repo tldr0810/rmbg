@@ -1,7 +1,5 @@
 # Cloudflare Worker Starter for Manyfold Agents
 
-English · [中文](README_CN.md)
-
 A Cloudflare Workers app template pre-wired with [Manyfold](https://manyfold.ai) AI-agent
 connectivity. Deploy it in one click, connect your Manyfold agents from the page, verify the
 wiring with a streaming chat — then build whatever you actually wanted to build on top of a
@@ -160,6 +158,6 @@ AI agents working on this codebase.
   every error string is stripped of anything token-shaped before it can reach a log or the
   browser.
 
-## License
+## Licence
 
 [MIT](LICENSE)

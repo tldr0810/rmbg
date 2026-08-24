@@ -1,7 +1,7 @@
 # GEMINI.md — instructions for the rmbg service agent
 
 > **This file does not belong to this repository's build.** It is the instruction document for
-> the *service* agent `agt_agqcltvvo56wpo4ywhoxrgu2dy`, which has no repo of its own. Paste it
+> the *service* agent `<service-agent-id>`, which has no repo of its own. Paste it
 > into that agent's instructions. It is kept here so the prompt is version-controlled next to
 > the Worker that depends on it — when one changes, check the other.
 >

@@ -1,7 +1,10 @@
 import { GoogleGenAI } from '@google/genai';
 import fs from 'node:fs';
 
-const imagePath = '/home/sprite/.manyfold/workspaces/agt_agqbuknba5yirdoa6h3pbfuadq/chat-attachments/cts_agqbuma74z6aphzdgbk3sa2qoi/64fe0e00-5c75-4d6c-b860-a11554b86afe/Screenshot 2026-08-19 at 15.01.38.png';
+const imagePath = process.env.TEST_IMAGE_PATH;
+if (!imagePath) {
+  throw new Error('Set TEST_IMAGE_PATH to an image file before running this script.');
+}
 const imageBuffer = fs.readFileSync(imagePath);
 const base64Data = imageBuffer.toString('base64');
 

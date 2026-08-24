@@ -3,7 +3,7 @@
 ## Scope
 
 - Integrated the Atelier Apple-inspired layout into the production React homepage.
-- Preserved the existing upload, background-removal API, agent polling, history, comparison slider, background controls, color controls, and PNG export flows.
+- Preserved the existing upload, background-removal API, agent polling, history, comparison slider, background controls, colour controls, and PNG export flows.
 - Removed visible Traditional Chinese UI copy across the client and user-facing worker errors.
 - Forced the product surface to a white light theme.
 
@@ -11,7 +11,7 @@
 
 - Empty: split hero with custom upload/drop zone and workflow markers.
 - Processing: dedicated progress state with live agent status copy.
-- Studio / Ready: comparison canvas, background controls, effects, color grading, history, and export actions.
+- Studio / Ready: comparison canvas, background controls, effects, colour grading, history, and export actions.
 - Settings: English-only labels and the existing Manyfold / Cloudflare controls.
 
 ## Verification
