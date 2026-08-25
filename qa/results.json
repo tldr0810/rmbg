@@ -1,0 +1,58 @@
+[
+ {
+  "image": "dog_fur",
+  "size": "800x1283",
+  "infer_ms": 896,
+  "fg_pct": 14.89,
+  "bg_pct": 81.11,
+  "soft_edge_pct": 3.99
+ },
+ {
+  "image": "hair_curly",
+  "size": "800x1200",
+  "infer_ms": 929,
+  "fg_pct": 53.52,
+  "bg_pct": 38.62,
+  "soft_edge_pct": 7.86
+ },
+ {
+  "image": "man_portrait",
+  "size": "800x1200",
+  "infer_ms": 561,
+  "fg_pct": 57.87,
+  "bg_pct": 34.73,
+  "soft_edge_pct": 7.39
+ },
+ {
+  "image": "plant",
+  "size": "800x533",
+  "infer_ms": 553,
+  "fg_pct": 9.21,
+  "bg_pct": 73.3,
+  "soft_edge_pct": 17.49
+ },
+ {
+  "image": "pug",
+  "size": "800x1067",
+  "infer_ms": 572,
+  "fg_pct": 22.61,
+  "bg_pct": 69.67,
+  "soft_edge_pct": 7.72
+ },
+ {
+  "image": "sneaker",
+  "size": "800x533",
+  "infer_ms": 560,
+  "fg_pct": 23.29,
+  "bg_pct": 73.67,
+  "soft_edge_pct": 3.04
+ },
+ {
+  "image": "woman_field",
+  "size": "800x533",
+  "infer_ms": 563,
+  "fg_pct": 34.61,
+  "bg_pct": 61.92,
+  "soft_edge_pct": 3.47
+ }
+]
