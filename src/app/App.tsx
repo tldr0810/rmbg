@@ -468,6 +468,16 @@ export function App() {
 
       <footer className="app-footer">
         <p>© 2026 Atelier — Powered by Cloudflare Workers & Manyfold AI</p>
+        <a
+          className="footer-github-link"
+          href="https://github.com/manyfold-open/rmbg"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="Open the Atelier GitHub repository"
+          title="GitHub repository"
+        >
+          <img src="/github.svg" alt="" aria-hidden="true" />
+        </a>
       </footer>
     </div>
   );

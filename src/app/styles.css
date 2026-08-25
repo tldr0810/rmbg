@@ -1795,11 +1795,46 @@ textarea:focus {
 /* ── Footer ── */
 .app-footer {
   margin-top: var(--space-section);
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
   color: var(--muted);
   font-size: 12px;
   border-top: 1px solid var(--border);
   padding-top: var(--space-lg);
+}
+
+.app-footer p {
+  margin: 0;
+}
+
+.footer-github-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  opacity: 0.64;
+  transition: opacity 0.2s ease, background-color 0.2s ease;
+}
+
+.footer-github-link:hover,
+.footer-github-link:focus-visible {
+  opacity: 1;
+  background: var(--surface-subtle);
+}
+
+.footer-github-link:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.footer-github-link img {
+  width: 16px;
+  height: 16px;
+  display: block;
 }
 
 /* ── Mobile RWD ── */
