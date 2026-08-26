@@ -188,7 +188,7 @@ export interface JobNote {
 }
 
 /** An agent's failure text can be a whole transcript. Enough to diagnose, not to store. */
-const MAX_NOTE_CHARS = 2000;
+export const MAX_NOTE_CHARS = 2000;
 
 /** Best-effort: a note that fails to save must never fail the job it describes. */
 export async function setJobNote(
@@ -205,6 +205,30 @@ export async function setJobNote(
     .bind(jobId, kind, note.slice(0, MAX_NOTE_CHARS), now())
     .run()
     .catch(() => undefined);
+}
+
+/**
+ * Write a note, unless the agent has already reported a failure of its own.
+ *
+ * The agent is the only party that knows *why* a job produced nothing — which check rejected
+ * the frames, which import was missing, which call came back empty. This side finds out only
+ * that no upload arrived, minutes later, and phrases it as such. Both write to the same row,
+ * and the agent's note lands first, so without this guard the useful reason is routinely
+ * overwritten by "did not upload the result" on its way to the browser.
+ *
+ * A `failed` note is therefore final: the turn is over and no later observation improves on
+ * it. `done` bypasses this entirely — a result that arrives after a reported failure is still
+ * a result, and status wins over note regardless.
+ */
+export async function setJobNoteUnlessFailed(
+  env: Env,
+  jobId: string,
+  kind: JobNoteKind,
+  note: string,
+): Promise<void> {
+  const existing = await getJobNote(env, jobId);
+  if (existing?.kind === 'failed') return;
+  await setJobNote(env, jobId, kind, note);
 }
 
 export async function getJobNote(env: Env, jobId: string): Promise<JobNote | null> {

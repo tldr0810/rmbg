@@ -9,6 +9,7 @@ import {
   createJobTicket,
   pruneJobTickets,
   setJobNote,
+  setJobNoteUnlessFailed,
   sha256Hex,
   type JobTicket,
 } from './job';
@@ -322,6 +323,8 @@ function agentInstructions(
   workDir: string,
   inputUrl: string,
   uploadUrl: string,
+  /** Where a turn with nothing to upload posts its reason. Same ticket as the upload. */
+  noteUrl: string,
   token: string,
   model: string,
   /** Text model for the naming call. Unused when `subject` is supplied. */
@@ -356,7 +359,7 @@ STEP 2 — render this subject twice, once over white and once over black. Run t
 from google import genai
 from google.genai import types
 from PIL import Image
-import json, sys
+import json, os, sys
 D = '${workDir}'
 client = genai.Client()
 # STEP 3 writes retry.json when it rejects an attempt: a sentence naming what went wrong, aimed
@@ -365,6 +368,13 @@ try:
     extra = json.load(open(D + '/retry.json'))
 except Exception:
     extra = {}
+# ...and plan.json naming which frames it wants drawn again. A fault the checks pin on the black
+# call alone leaves white.png standing: it has already been measured against input.png and
+# passed, so redrawing it spends a 2K generation on a fresh chance to go wrong.
+try:
+    plan = set(json.load(open(D + '/plan.json')))
+except Exception:
+    plan = {'white', 'black'}
 
 def gen(src, out, instruction):
     data = open(src, 'rb').read()
@@ -447,7 +457,11 @@ BLACK = (f"Keep this image exactly as it is and change only the background colou
 
 if extra:
     print('RETRY hints in effect: ' + ', '.join(sorted(extra)))
-gen(D + '/input.png', D + '/white.png', WHITE + extra.get('white', ''))
+if 'white' in plan or not os.path.exists(D + '/white.png'):
+    gen(D + '/input.png', D + '/white.png', WHITE + extra.get('white', ''))
+else:
+    print('white.png kept from the previous attempt - it matched the input, only the black '
+          'frame was at fault')
 gen(D + '/white.png', D + '/black.png', BLACK + extra.get('black', ''))
 EOF
 
@@ -470,16 +484,20 @@ model your own way:
     the arithmetic in STEP 3 still returns a confident answer — for whichever object the second
     call settled on.
 
-It prints \`subject=...\` and then one line per frame, e.g. \`white.png (2048, 2048) tokens=1958\`.
-Include all three lines in your final reply. The subject line is the only place the choice of
-what to cut out is visible, so it matters even when the frames look healthy.
+It prints \`subject=...\` and then one line per frame it drew, e.g. \`white.png (2048, 2048)
+tokens=1958\`. Include every line it prints in your final reply. The subject line is the only
+place the choice of what to cut out is visible, so it matters even when the frames look healthy.
+On a retry it may say it kept white.png instead of drawing it: that is STEP 3 telling it the
+white frame was fine and only the black call went wrong, and it is correct — do not draw the
+white frame again by hand.
 
 STEP 3 — solve for the alpha channel, at the original size:
 
   python3 - <<'EOF'
 from PIL import Image
-import numpy as np, glob, json, os, sys
+import numpy as np, json, os, shutil, sys
 D = '${workDir}'
+MAX_ATTEMPTS = 3
 src = Image.open(D + '/input.png').convert('RGB')
 # What STEP 2 decided it was cutting out. Reported below rather than checked: no measurement
 # here can tell a correct choice from a wrong one, so the job of this line is to put the choice
@@ -498,69 +516,87 @@ def frame(name):
         im = im.resize(src.size, Image.LANCZOS)
     return np.array(im).astype(np.float32)
 
-white, black = frame('white.png'), frame('black.png')
-# The same subject over two known backgrounds is two equations in one unknown:
-#   obs_white = alpha * F + (1 - alpha) * 255
-#   obs_black = alpha * F + (1 - alpha) * 0
-# Subtracting cancels the subject entirely, whatever colour it is:
-#   obs_white - obs_black = (1 - alpha) * 255
-d = np.clip((white - black).mean(axis=2), 0.0, 255.0)
-alpha = 1.0 - d / 255.0
-# Two model calls never return byte-identical subject pixels, so d wobbles a few counts either
-# side of zero across solid parts of the subject. Snap only those last few counts at each end;
-# every fractional alpha in between is the identity above and is left exactly as solved.
-alpha[d <= 8.0] = 1.0
-alpha[d >= 247.0] = 0.0
-a8 = np.round(alpha * 255).astype(np.uint8)
-clear = float((a8 == 0).mean())
-solid = float((a8 == 255).mean())
-
-# Everything above compares the two frames with each other, and black.png is an edit OF
-# white.png, so they agree by construction even when both are wrong about this photo. The two
-# checks below compare the answer with input.png, the only thing in this job that is not model
-# output. Neither looks at what the picture is of, so both hold for any photograph.
+# input.png is the only thing in this job that is not model output, so it is the reference the
+# tile test below measures against. Set up once: every attempt is judged on the same grid.
 srcf = np.array(src, dtype=np.float32)
-opaque = a8 == 255
-opaque_px = max(int(opaque.sum()), 1)
-
-# (a) Background the second call never converted. Pure white in BOTH frames makes d = 0, so
-# alpha solves to 1 and the patch is delivered as subject; if the input is not white there, it
-# was background, and it is about to go out opaque.
-unconv = (opaque & (white.min(axis=2) >= 244.0) & (black.min(axis=2) >= 244.0)
-          & (np.abs(srcf - 255.0).mean(axis=2) > 12.0))
-unconv_px = int(unconv.sum())
-
-# (b) white.png is meant to be this photo with its background replaced, so wherever the mask is
-# about to call a pixel opaque, the frame must still show what the input shows there. Tile by
-# tile, because a hole is small and a frame-wide average would swallow it. Judge a tile only if
-# it is mostly inside the silhouette; call it off if the mean difference is large, if both sides
-# have texture that does not correlate, or if one side is flat where the other is busy.
 T = 32
 h, w = (srcf.shape[0] // T) * T, (srcf.shape[1] // T) * T
 
 def tiles(a):
     return a[:h, :w].reshape(h // T, T, w // T, T).swapaxes(1, 2).reshape(h // T, w // T, T * T)
 
-m = tiles(opaque[:h, :w].astype(np.float32))
-n = m.sum(axis=2)
-judged = n >= T * T * 0.5
-nz = np.maximum(n, 1.0)
-gs, gw = tiles(srcf.mean(axis=2)), tiles(white.mean(axis=2))
-mad = (m * tiles(np.abs(srcf - white).mean(axis=2))).sum(axis=2) / nz
-mu_s, mu_w = (m * gs).sum(axis=2) / nz, (m * gw).sum(axis=2) / nz
-ds, dw = gs - mu_s[..., None], gw - mu_w[..., None]
-sd_s = np.sqrt(np.maximum((m * ds * ds).sum(axis=2) / nz, 0.0))
-sd_w = np.sqrt(np.maximum((m * dw * dw).sum(axis=2) / nz, 0.0))
-corr = (m * ds * dw).sum(axis=2) / nz / np.maximum(sd_s * sd_w, 1e-6)
-off = judged & ((mad > 40.0)
-                | ((sd_s >= 6.0) & (sd_w >= 6.0) & (corr < 0.35))
-                | ((sd_s < 4.0) & (sd_w >= 16.0)) | ((sd_w < 4.0) & (sd_s >= 16.0)))
-judged_n, off_n = int(judged.sum()), int(off.sum())
-agree = 1.0 - off_n / max(judged_n, 1)
+def measure(white, black):
+    # The same subject over two known backgrounds is two equations in one unknown:
+    #   obs_white = alpha * F + (1 - alpha) * 255
+    #   obs_black = alpha * F + (1 - alpha) * 0
+    # Subtracting cancels the subject entirely, whatever colour it is:
+    #   obs_white - obs_black = (1 - alpha) * 255
+    d = np.clip((white - black).mean(axis=2), 0.0, 255.0)
+    alpha = 1.0 - d / 255.0
+    # Two model calls never return byte-identical subject pixels, so d wobbles a few counts
+    # either side of zero across solid parts of the subject. Snap only those last few counts at
+    # each end; every fractional alpha in between is the identity above, left exactly as solved.
+    alpha[d <= 8.0] = 1.0
+    alpha[d >= 247.0] = 0.0
+    a8 = np.round(alpha * 255).astype(np.uint8)
+    opaque = a8 == 255
+    opaque_px = max(int(opaque.sum()), 1)
 
-print('CHECK transparent=%.2f%% partial=%.2f%% opaque=%.2f%% agree=%.0f%%(%d/%d tiles) '
-      'unconverted=%dpx subject=%s' % (clear * 100, (1 - clear - solid) * 100, solid * 100,
-                                       agree * 100, judged_n - off_n, judged_n, unconv_px, S))
+    # Everything so far compares the two frames with each other, and black.png is an edit OF
+    # white.png, so they agree by construction even when both are wrong about this photo. The
+    # two checks below compare the answer with input.png instead. Neither looks at what the
+    # picture is of, so both hold for any photograph.
+    #
+    # (a) Background the second call never converted. Pure white in BOTH frames makes d = 0, so
+    # alpha solves to 1 and the patch is delivered as subject; if the input is not white there,
+    # it was background, and it is about to go out opaque.
+    unconv = (opaque & (white.min(axis=2) >= 244.0) & (black.min(axis=2) >= 244.0)
+              & (np.abs(srcf - 255.0).mean(axis=2) > 12.0))
+
+    # (b) white.png is meant to be this photo with its background replaced, so wherever the mask
+    # is about to call a pixel opaque, the frame must still show what the input shows there. Tile
+    # by tile, because a hole is small and a frame-wide average would swallow it. Judge a tile
+    # only if it is mostly inside the silhouette; call it off if the mean difference is large, if
+    # both sides have texture that does not correlate, or if one side is flat where the other is
+    # busy.
+    m = tiles(opaque[:h, :w].astype(np.float32))
+    n = m.sum(axis=2)
+    judged = n >= T * T * 0.5
+    nz = np.maximum(n, 1.0)
+    gs, gw = tiles(srcf.mean(axis=2)), tiles(white.mean(axis=2))
+    mad = (m * tiles(np.abs(srcf - white).mean(axis=2))).sum(axis=2) / nz
+    mu_s, mu_w = (m * gs).sum(axis=2) / nz, (m * gw).sum(axis=2) / nz
+    ds, dw = gs - mu_s[..., None], gw - mu_w[..., None]
+    sd_s = np.sqrt(np.maximum((m * ds * ds).sum(axis=2) / nz, 0.0))
+    sd_w = np.sqrt(np.maximum((m * dw * dw).sum(axis=2) / nz, 0.0))
+    corr = (m * ds * dw).sum(axis=2) / nz / np.maximum(sd_s * sd_w, 1e-6)
+    off = judged & ((mad > 40.0)
+                    | ((sd_s >= 6.0) & (sd_w >= 6.0) & (corr < 0.35))
+                    | ((sd_s < 4.0) & (sd_w >= 16.0)) | ((sd_w < 4.0) & (sd_s >= 16.0)))
+    judged_n, off_n = int(judged.sum()), int(off.sum())
+
+    # A hole is a patch, and a patch is contiguous. A redraw that merely wanders off the
+    # original disagrees in scattered single tiles wherever the picture happened to be busy,
+    # which is the difference that tells the two apart at any size. Count a tile as clustered
+    # when it has at least two off neighbours in its 3x3 - padded, so tiles at the edge of the
+    # frame are not treated as neighbours of tiles at the opposite edge.
+    o = off.astype(np.int32)
+    p = np.pad(o, 1)
+    nb = sum(p[dy:dy + o.shape[0], dx:dx + o.shape[1]]
+             for dy in (0, 1, 2) for dx in (0, 1, 2))
+    clustered = off & (nb >= 3)
+
+    return {'alpha': alpha, 'a8': a8, 'off': off, 'clustered': clustered, 'unconv': unconv,
+            'clear': float((a8 == 0).mean()), 'solid': float((a8 == 255).mean()),
+            'opaque_px': opaque_px, 'unconv_px': int(unconv.sum()),
+            'judged_n': judged_n, 'off_n': off_n, 'clustered_n': int(clustered.sum()),
+            'agree': 1.0 - off_n / max(judged_n, 1)}
+
+def report(q):
+    print('CHECK transparent=%.2f%% partial=%.2f%% opaque=%.2f%% agree=%.0f%%(%d/%d tiles) '
+          'unconverted=%dpx subject=%s'
+          % (q['clear'] * 100, (1 - q['clear'] - q['solid']) * 100, q['solid'] * 100,
+             q['agree'] * 100, q['judged_n'] - q['off_n'], q['judged_n'], q['unconv_px'], S))
 
 def where(mask, grid):
     ys, xs = np.nonzero(mask)
@@ -570,72 +606,142 @@ def where(mask, grid):
     return ' around x=%d..%d y=%d..%d' % (xs.min() * s, xs.max() * s + s - 1,
                                           ys.min() * s, ys.max() * s + s - 1)
 
-fatal, soft, hint = [], [], {}
-if clear < 0.001:
+def deliver(black, q):
+    # Un-premultiply: obs_black is alpha * F, so the subject's own colour is obs_black / alpha.
+    # Fully-opaque pixels are taken from the ORIGINAL instead — the model redraws the subject,
+    # and its redrawing is not the photograph the user sent. Only the partly-transparent edge
+    # comes from the solved frame, because an anti-aliased boundary is a blend of subject and
+    # background that the original cannot supply.
+    F = black / np.clip(q['alpha'], 1e-3, 1.0)[..., None]
+    rgb_out = np.where(q['a8'][..., None] == 255, srcf, np.clip(F, 0.0, 255.0)).astype(np.uint8)
+    Image.fromarray(np.dstack([rgb_out, q['a8']]), 'RGBA').save(D + '/output.png')
+
+white, black = frame('white.png'), frame('black.png')
+q = measure(white, black)
+report(q)
+
+# Each rule also says which frames have to be drawn again. A fault that only the black call can
+# have caused does not condemn the white frame, and redrawing a frame that already passed is
+# both a wasted 2K generation and a fresh chance for it to come back wrong.
+fatal, soft, hint, regen = [], [], {}, set()
+if q['clear'] < 0.001:
     fatal.append('THE TWO FRAMES MATCH: only %.2f%% of this came out transparent, so white.png '
                  'and black.png carry the same background and there is nothing to subtract. '
                  'Check the second call really edited white.png to a black background.'
-                 % (clear * 100))
-if solid < 0.001:
+                 % (q['clear'] * 100))
+    regen |= {'white', 'black'}
+if q['solid'] < 0.001:
     fatal.append('THE SUBJECT IS GONE: %.2f%% of this is fully opaque, so one of the two frames '
-                 'came back blank.' % (solid * 100))
-if judged_n >= 8 and agree < 0.75:
+                 'came back blank.' % (q['solid'] * 100))
+    regen |= {'white', 'black'}
+if q['judged_n'] >= 8 and q['agree'] < 0.75:
     fatal.append('THE FRAMES ARE NOT THIS PHOTO: %d of %d tiles inside the silhouette show '
                  'something other than the input%s. The model re-framed, rescaled or redrew the '
                  'subject instead of only changing the background, so this mask fits a picture '
                  'nobody asked for: laid over the original it would cut out the wrong pixels.'
-                 % (off_n, judged_n, where(off, True)))
+                 % (q['off_n'], q['judged_n'], where(q['off'], True)))
     hint['white'] = (f' Do not crop, zoom, pan, rotate or re-centre anything. The output frame '
                      f'must match the input frame exactly: same field of view, {S} the same '
                      f'size, in the same place, covering the same pixels. A previous attempt '
                      f'moved it, which made the result unusable. Change only the background '
                      f'colour.')
-if unconv_px > max(256, 0.005 * opaque_px):
+    regen |= {'white', 'black'}
+if q['unconv_px'] > max(256, 0.005 * q['opaque_px']):
     fatal.append('BACKGROUND LEFT INSIDE THE SUBJECT: %d pixels%s are pure white in both frames '
                  'while the input is not white there, so the second call never converted that '
-                 'patch and it would be delivered opaque.' % (unconv_px, where(unconv, False)))
+                 'patch and it would be delivered opaque.'
+                 % (q['unconv_px'], where(q['unconv'], False)))
     hint['black'] = (f' This includes any white area fully enclosed by {S} - a hole '
                      f'through it, a gap between its parts, the space inside a handle, a loop or '
                      f'a ring. A previous attempt left such a patch white; every white pixel that '
                      f'is not {S} itself has to become black.')
-if not fatal and off_n >= 2:
-    soft.append('SUSPECT %d of %d tiles inside the silhouette%s do not match the input, which is '
-                'what an enclosed gap painted over as subject looks like.'
-                % (off_n, judged_n, where(off, True)))
+    regen.add('black')
+# A couple of odd tiles is what a redraw of a busy photograph looks like, not a defect: the model
+# never returns the subject byte-for-byte. A fixed count of 2 made that noise a rejection on every
+# large photo, which cost two more generations and threw away a frame scoring 914 of 916. Two
+# readings of the same tiles now have to agree before another attempt is spent:
+#
+#   - enough of them to be more than noise, scaled to the silhouette so that the same picture is
+#     judged the same way whatever size it arrives at, with a floor for small ones where a single
+#     tile really is a large fraction of the subject;
+#   - or few but contiguous, because a gap painted over as subject is a patch and stays a patch
+#     however large the photo around it is. Scaling alone would have let a six-tile hole through
+#     on a nine-hundred-tile silhouette, which is the same defect this check exists to catch.
+#
+# The fatal rules above are untouched. This one only decides when a merely suspect frame is worth
+# drawing again.
+soft_min = max(4, int(q['judged_n'] * 0.03))
+if not fatal and (q['off_n'] >= soft_min or q['clustered_n'] >= 4):
+    at = q['clustered'] if q['clustered_n'] else q['off']
+    soft.append('SUSPECT %d of %d tiles inside the silhouette do not match the input, %d of them '
+                'in a contiguous patch%s, which is what an enclosed gap painted over as subject '
+                'looks like.'
+                % (q['off_n'], q['judged_n'], q['clustered_n'], where(at, True)))
     hint['white'] = hint.get('white', '') + (
         ' Look again at the area around x=%d y=%d: if the backdrop is visible there it is '
         'background and must come out white, however completely the subject surrounds it.'
-        % (int(np.nonzero(off)[1].mean() * T), int(np.nonzero(off)[0].mean() * T)))
+        % (int(np.nonzero(at)[1].mean() * T), int(np.nonzero(at)[0].mean() * T)))
+    regen |= {'white', 'black'}
 
-# Rejected frames are kept rather than deleted, so a run that ends badly can still be looked at.
-attempt = len(glob.glob(D + '/rejected-*-white.png')) + 1
-if fatal or (soft and attempt < 3):
-    for name in ('white.png', 'black.png'):
-        if os.path.exists(D + '/' + name):
-            os.replace(D + '/' + name, '%s/rejected-%d-%s' % (D, attempt, name))
-    for line in fatal + soft:
-        print(line)
-    if attempt >= 3 and fatal:
-        sys.exit('GIVING UP after %d attempts. Do not upload anything: reply with the CHECK line '
-                 'and the reason above.' % attempt)
+if not fatal and not soft:
+    deliver(black, q)
+    sys.exit(0)
+
+# Keep this attempt where a later one can still reach it. Frames that are about to be drawn again
+# are moved, so a STEP 2 that dies cannot leave a stale frame to be scored a second time; a frame
+# being kept is copied instead, because it stays in place for the next black call to edit.
+try:
+    log = json.load(open(D + '/attempts.json'))
+except Exception:
+    log = []
+n = len(log) + 1
+files = {}
+for name in ('white', 'black'):
+    live = '%s/%s.png' % (D, name)
+    if os.path.exists(live):
+        arch = 'attempt-%d-%s.png' % (n, name)
+        (os.replace if name in regen else shutil.copyfile)(live, D + '/' + arch)
+        files[name] = arch
+log.append({'n': n, 'fatal': bool(fatal), 'off': q['off_n'], 'unconv': q['unconv_px'],
+            'files': files})
+json.dump(log, open(D + '/attempts.json', 'w'))
+
+for line in fatal + soft:
+    print(line)
+
+if n < MAX_ATTEMPTS:
     json.dump(hint, open(D + '/retry.json', 'w'))
+    json.dump(sorted(regen) or ['white', 'black'], open(D + '/plan.json', 'w'))
     sys.exit('ATTEMPT %d REJECTED, no file written. Run the STEP 2 command again exactly as it '
              'is - it picks up %s/retry.json by itself - then run this STEP 3 command again.'
-             % (attempt, D))
+             % (n, D))
 
-# Un-premultiply: obs_black is alpha * F, so the subject's own colour is obs_black / alpha.
-# Fully-opaque pixels are taken from the ORIGINAL instead — the model redraws the subject, and
-# its redrawing is not the photograph the user sent. Only the partly-transparent edge comes
-# from the solved frame, because an anti-aliased boundary is a blend of subject and background
-# that the original cannot supply.
-F = black / np.clip(alpha, 1e-3, 1.0)[..., None]
-rgb_out = np.where(a8[..., None] == 255,
-                   np.array(src, dtype=np.float32),
-                   np.clip(F, 0.0, 255.0)).astype(np.uint8)
-Image.fromarray(np.dstack([rgb_out, a8]), 'RGBA').save(D + '/output.png')
-for line in soft:
-    print(line + ' Three attempts have not cleared it, so this is going out as it stands - put '
-                 'this line in your reply.')
+# Out of attempts. Being rejected is not the same as being unusable: only a fatal fault makes
+# frames worthless, whereas a suspect attempt was set aside in the hope of a better one, not
+# because it was broken. Three attempts used to end in nothing whenever the last of them happened
+# to be the bad one, discarding a perfectly deliverable earlier frame on the way. Take the best of
+# what was actually drawn instead, and fail only when every attempt was genuinely faulty.
+usable = [a for a in log if not a['fatal'] and len(a['files']) == 2]
+if not usable:
+    open(D + '/failure.txt', 'w').write(
+        'Background removal gave up after %d attempts, every one of them faulty. subject=%s. '
+        'Last attempt: transparent=%.2f%% opaque=%.2f%% agree=%.0f%%(%d/%d tiles) '
+        'unconverted=%dpx. %s\n'
+        % (n, S, q['clear'] * 100, q['solid'] * 100, q['agree'] * 100,
+           q['judged_n'] - q['off_n'], q['judged_n'], q['unconv_px'], ' '.join(fatal + soft)))
+    sys.exit('GIVING UP after %d attempts, every one of them faulty. Do not upload anything: run '
+             'the STEP 5 command to report %s/failure.txt, then reply with the CHECK line and the '
+             'reason above.' % (n, D))
+best = min(usable, key=lambda a: (a['off'], a['unconv']))
+bw, bb = frame(best['files']['white']), frame(best['files']['black'])
+qb = measure(bw, bb)
+deliver(bb, qb)
+print('DELIVERING attempt %d of %d - not perfect, but the closest to the input of everything '
+      'these %d attempts drew. %d of %d tiles inside the silhouette still disagree, so check the '
+      'result before using it. Put this line in your reply, and the CHECK line below it, which '
+      'describes the file that is about to be uploaded.' % (best['n'], n, n, qb['off_n'],
+                                                            qb['judged_n']))
+report(qb)
 EOF
 
 That script is complete as written. There is no threshold to tune, no key colour to fill in and
@@ -657,10 +763,17 @@ which none of the others can tell you either: a cutout of the wrong object score
 every number on that line, because the arithmetic was right and only the choice was wrong.
 
 If the script exits without writing a file, do exactly what it says: run the STEP 2 command
-again unchanged (it reads the note STEP 3 left for it) and then STEP 3 again. Up to three
+again unchanged (it reads the notes STEP 3 left for it) and then STEP 3 again. Up to three
 attempts. Never upload a file this script refused to write, and never edit the frames or the
-script by hand to get past it — if it gives up after three attempts, an honest failure with the
-CHECK line is the right answer.
+script by hand to get past it.
+
+On the third attempt the script stops asking for better and hands back the best of what it has,
+which is usually not the third attempt: it keeps every attempt it drew and picks the one that
+matches the input most closely. A \`DELIVERING attempt N of 3\` line means exactly that — a real
+result, with the reservation printed next to it. Upload it as normal and pass both that line and
+the CHECK line under it through to your reply; that CHECK line, not the earlier one, describes
+the file you uploaded. It only says \`GIVING UP\` when every attempt was faulty, and then there is
+genuinely nothing to send: report it with STEP 5 instead of uploading.
 
 If PIL, numpy or google-genai is unavailable, do not improvise and do not upload — say which
 import failed in your reply instead.
@@ -683,6 +796,29 @@ SUSPECT line — nothing else. Those lines are the only record of what was cut o
 resolution the model actually returned, how much of the frame came out transparent, and whether
 the frames were about the photo that was sent. They are read by a person, not parsed by the
 Worker.
+
+STEP 5 — only when there is nothing to upload. Send the reason back:
+
+  curl -sS -X POST --data-binary @${workDir}/failure.txt \\
+    -H 'content-type: text/plain' \\
+    -H 'x-job-token: ${token}' \\
+    '${noteUrl}'
+
+STEP 3 writes that file itself when it gives up, so run this exactly as written rather than
+composing a message of your own. If some other command failed instead — a missing import, a
+model call that returned nothing, a download that 404'd — write the file first, then run the
+same curl:
+
+  printf '%s\\n' 'STEP n failed: <the command> printed <what it printed>' > ${workDir}/failure.txt
+
+Do this before you reply. A person is watching a progress bar on the other side of this and your
+reply text does not reach them: without this call, all they are ever told is that the wait ran
+out — which is equally true of a crash, a refusal and a model outage. This is the only way the
+real reason gets to them. If the curl itself fails, carry on and put the reason in your reply
+instead: it is a report, not a gate, and it must never become a second failure.
+
+Never run STEP 5 for a job you uploaded. The upload is the answer, and a failure note on top of
+a delivered cutout only contradicts it.
 
 The upload is how the result gets back — your reply text is not the delivery channel, so do
 not paste base64 into it. If any step fails, reply with plain text saying exactly which
@@ -824,6 +960,8 @@ interface AgentJob {
   ticket: JobTicket;
   inputUrl: string;
   uploadUrl: string;
+  /** Where the agent posts a failure it cannot upload past. See `POST /api/job/:id/note`. */
+  noteUrl: string;
   mimeType: string;
   model: string;
   /** Text model for STEP 2's naming call. Unused when `subject` is set. */
@@ -877,6 +1015,7 @@ async function runAgentJob(job: AgentJob, graceMs: number, pollMs?: number): Pro
               workDirFor(ticket.jobId),
               job.inputUrl,
               job.uploadUrl,
+              job.noteUrl,
               ticket.token,
               job.model,
               job.textModel,
@@ -924,7 +1063,7 @@ async function runAgentJob(job: AgentJob, graceMs: number, pollMs?: number): Pro
           // asking again once a sibling turn frees a slot.
           const delay = dispatchRetryDelay(attempt);
           console.warn(`Manyfold A2A dispatch rejected, retrying in ${delay}ms:`, message);
-          await setJobNote(
+          await setJobNoteUnlessFailed(
             env,
             ticket.jobId,
             'progress',
@@ -942,7 +1081,7 @@ async function runAgentJob(job: AgentJob, graceMs: number, pollMs?: number): Pro
         // that the job failed — only that we stopped hearing about it.
         streamError = message;
         console.error('Manyfold A2A stream error:', streamError);
-        await setJobNote(
+        await setJobNoteUnlessFailed(
           env,
           ticket.jobId,
           'progress',
@@ -957,7 +1096,7 @@ async function runAgentJob(job: AgentJob, graceMs: number, pollMs?: number): Pro
     // event — and that is the same situation as a thrown connection error: the agent is
     // still working, we simply stopped hearing about it. Give both the full grace period.
     if (snapshot && !snapshot.terminal) {
-      await setJobNote(
+      await setJobNoteUnlessFailed(
         env,
         ticket.jobId,
         'progress',
@@ -1112,6 +1251,7 @@ export async function handleRemoveBg(
           ticket,
           inputUrl: `${origin}/api/r2/${encodeURIComponent(ticket.inputKey)}`,
           uploadUrl: `${origin}/api/job/${ticket.jobId}/output`,
+          noteUrl: `${origin}/api/job/${ticket.jobId}/note`,
           mimeType,
           // Fixed, not settings.bgRemoveModel: only an -image model can render the white and
           // black frames STEP 2 needs (see GEMINI.md). bgRemoveModel picks the text model for
@@ -1139,10 +1279,12 @@ export async function handleRemoveBg(
             runAgentJob(job, ASYNC_UPLOAD_GRACE_MS, ASYNC_UPLOAD_POLL_MS).catch(
               async (err: unknown) => {
                 // Nobody is left to throw to. The note is the only way this reaches the
-                // user, so it has to be written even when the failure is our own bug.
+                // user, so it has to be written even when the failure is our own bug — but
+                // never over the agent's own account of what went wrong, which is always the
+                // better answer than this side's "no upload arrived".
                 const message = err instanceof Error ? err.message : String(err);
                 console.error('Manyfold A2A background job failed:', message);
-                await setJobNote(env, ticket.jobId, 'failed', message);
+                await setJobNoteUnlessFailed(env, ticket.jobId, 'failed', message);
               },
             ),
           );

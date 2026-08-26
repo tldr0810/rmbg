@@ -8,6 +8,7 @@ import {
   pruneJobTickets,
   redeemJobTicket,
   setJobNote,
+  setJobNoteUnlessFailed,
   sha256Hex,
 } from '../src/worker/job';
 import type { Env } from '../src/worker/types';
@@ -104,6 +105,151 @@ describe('job tickets', () => {
     expect(a.jobId).not.toBe(b.jobId);
     expect(a.inputKey).toBe(`job_${a.jobId}_input.png`);
     expect(a.outputKey).toBe(outputKeyFor(a.jobId));
+  });
+});
+
+/**
+ * The other half of the agent's delivery story. The turn outlives the A2A stream it runs
+ * under, so a turn that ends with nothing to upload has no channel back: the browser is
+ * polling a job row, and this side can only ever observe that no upload arrived. Six images
+ * were submitted, four errored, and all four were reported to the user as an expired wait —
+ * the actual reasons (three rejected attempts, an unconverted patch, a generation that
+ * returned no image) existed only in a sandbox nobody was watching.
+ */
+describe('POST /api/job/:jobId/note', () => {
+  const post = (env: Env, jobId: string, body: string, token?: string) =>
+    app.request(
+      `/api/job/${jobId}/note`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'text/plain',
+          ...(token ? { 'x-job-token': token } : {}),
+        },
+        body,
+      },
+      env,
+    );
+
+  it('records the reason, on the ticket alone and with no Origin header', async () => {
+    const { db } = makeDb();
+    const env = { DB: db } as Env;
+    const ticket = await createJobTicket(env, 'png');
+
+    const res = await post(env, ticket.jobId, 'GIVING UP after 3 attempts: unconverted=127399px');
+
+    expect(res.status).toBe(403);
+
+    const ok = await post(
+      env,
+      ticket.jobId,
+      'GIVING UP after 3 attempts: unconverted=127399px',
+      ticket.token,
+    );
+    expect(ok.status).toBe(200);
+
+    const note = await getJobNote(env, ticket.jobId);
+    expect(note?.kind).toBe('failed');
+    expect(note?.note).toContain('unconverted=127399px');
+  });
+
+  it('reaches the browser through the status route, which is the whole point', async () => {
+    const { db } = makeDb();
+    const env = { DB: db } as Env;
+    const ticket = await createJobTicket(env, 'png');
+    await post(env, ticket.jobId, 'STEP 2 failed: NO IMAGE for white.png', ticket.token);
+
+    const res = await app.request(`/api/job/${ticket.jobId}/status`, {}, env);
+    const body = (await res.json()) as { note: { kind: string; note: string } | null };
+    expect(body.note?.kind).toBe('failed');
+    expect(body.note?.note).toContain('NO IMAGE for white.png');
+  });
+
+  it('does not spend the ticket, so a job that recovers can still upload', async () => {
+    // Reporting a failure is not a verdict on the job. If the agent tries once more and
+    // succeeds, the upload has to be accepted — status beats note.
+    const { db } = makeDb();
+    const { bucket, store } = makeR2();
+    const env = { DB: db, R2_IMAGE: bucket } as Env;
+    const ticket = await createJobTicket(env, 'png');
+    await post(env, ticket.jobId, 'GIVING UP after 3 attempts', ticket.token);
+
+    const upload = await app.request(
+      `/api/job/${ticket.jobId}/output`,
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'image/png', 'x-job-token': ticket.token },
+        body: Uint8Array.from(atob(CUTOUT_PNG_BASE64), (ch) => ch.charCodeAt(0)),
+      },
+      env,
+    );
+
+    expect(upload.status).toBe(200);
+    expect(store.has(outputKeyFor(ticket.jobId))).toBe(true);
+  });
+
+  it('refuses an empty note and an oversized one', async () => {
+    const { db } = makeDb();
+    const env = { DB: db } as Env;
+    const ticket = await createJobTicket(env, 'png');
+
+    expect((await post(env, ticket.jobId, '   ', ticket.token)).status).toBe(400);
+    expect((await post(env, ticket.jobId, 'x'.repeat(70 * 1024), ticket.token)).status).toBe(413);
+    expect(await getJobNote(env, ticket.jobId)).toBeNull();
+  });
+
+  it('stores a long reason truncated rather than refusing it', async () => {
+    const { db } = makeDb();
+    const env = { DB: db } as Env;
+    const ticket = await createJobTicket(env, 'png');
+
+    await post(env, ticket.jobId, `${'y'.repeat(5000)}`, ticket.token);
+
+    const note = await getJobNote(env, ticket.jobId);
+    expect(note?.note.length).toBe(2000);
+  });
+});
+
+describe('setJobNoteUnlessFailed', () => {
+  /**
+   * Both parties write the same row and the agent's note lands first: it posts its reason at
+   * the moment it gives up, while this side only concludes "no upload arrived" once the grace
+   * period runs out, minutes later. Without the guard the useful reason is overwritten by the
+   * generic one on its way to the browser.
+   */
+  it('leaves a reported failure alone', async () => {
+    const { db } = makeDb();
+    const env = { DB: db } as Env;
+    await setJobNote(env, 'job1', 'failed', 'GIVING UP after 3 attempts: unconverted=127399px');
+
+    await setJobNoteUnlessFailed(env, 'job1', 'failed', 'did not upload the result');
+    await setJobNoteUnlessFailed(env, 'job1', 'progress', 'still waiting');
+
+    expect((await getJobNote(env, 'job1'))?.note).toContain('unconverted=127399px');
+  });
+
+  it('writes when there is no note, or only progress so far', async () => {
+    const { db } = makeDb();
+    const env = { DB: db } as Env;
+
+    await setJobNoteUnlessFailed(env, 'job2', 'progress', 'handed to the agent');
+    expect((await getJobNote(env, 'job2'))?.note).toBe('handed to the agent');
+
+    await setJobNoteUnlessFailed(env, 'job2', 'failed', 'the agent never started');
+    const note = await getJobNote(env, 'job2');
+    expect(note?.kind).toBe('failed');
+    expect(note?.note).toBe('the agent never started');
+  });
+
+  it('still lets a result overrule a reported failure', async () => {
+    // A cutout that turns up after the agent gave up is still a cutout.
+    const { db } = makeDb();
+    const env = { DB: db } as Env;
+    await setJobNote(env, 'job3', 'failed', 'GIVING UP after 3 attempts');
+
+    await setJobNote(env, 'job3', 'done', 'Background removal complete.');
+
+    expect((await getJobNote(env, 'job3'))?.kind).toBe('done');
   });
 });
 

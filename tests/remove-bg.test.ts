@@ -430,12 +430,108 @@ describe('remove-bg handler', () => {
       expect(prompt).toContain(`extra.get('white', '')`);
       expect(prompt).toContain(`extra.get('black', '')`);
       expect(prompt).toContain(`json.dump(hint, open(D + '/retry.json', 'w'))`);
-      // Rejected frames are kept, not overwritten: a job that ends badly stays diagnosable.
-      expect(prompt).toContain(`'%s/rejected-%d-%s' % (D, attempt, name)`);
-      expect(prompt).toContain(`glob.glob(D + '/rejected-*-white.png')`);
+      // Rejected frames are kept, not overwritten: a job that ends badly stays diagnosable,
+      // and the ledger is what a later attempt reads to find the best of them.
+      expect(prompt).toContain(`'attempt-%d-%s.png' % (n, name)`);
+      expect(prompt).toContain(`json.dump(log, open(D + '/attempts.json', 'w'))`);
       // And the retrying is bounded — an honest failure beats an unbounded spend.
+      expect(prompt).toContain('MAX_ATTEMPTS = 3');
       expect(prompt).toContain('GIVING UP after %d attempts');
       expect(prompt).toContain(workDirFor(jobId));
+    });
+
+    /**
+     * Two production jobs in one batch of six errored with a deliverable frame sitting on the
+     * agent's disk. Both scored inside the silhouette — `agree=99.8%(914/916)`, then
+     * `agree=98.9%(186/188)` — were soft-rejected in the hope of better, and the retry that
+     * followed came back genuinely broken. The user got an error for a job that had already
+     * succeeded twice.
+     */
+    it('delivers the best attempt rather than nothing when the last one is the bad one', async () => {
+      const { prompt } = await capturePrompt();
+
+      // Only a fatal fault disqualifies an attempt; a suspect one stays a candidate.
+      expect(prompt).toContain(`usable = [a for a in log if not a['fatal'] and len(a['files']) == 2]`);
+      expect(prompt).toContain(`best = min(usable, key=lambda a: (a['off'], a['unconv']))`);
+      expect(prompt).toContain('DELIVERING attempt %d of %d');
+      // Giving up is now reserved for the case where there is genuinely nothing to send.
+      expect(prompt).toContain('GIVING UP after %d attempts, every one of them faulty');
+      // The delivered attempt is re-measured, so the CHECK line describes the uploaded file
+      // rather than whichever attempt happened to run last.
+      expect(prompt).toContain('qb = measure(bw, bb)');
+      expect(prompt).toContain('deliver(bb, qb)');
+    });
+
+    /**
+     * A fixed threshold of two odd tiles is noise on a large photo — 914 of 916 tiles agreeing
+     * was being called a defect — and each rejection costs two more 2K generations. Scaling it
+     * with the silhouette judges the same picture the same way at any size.
+     */
+    it('scales the suspect-tile threshold with the size of the silhouette', async () => {
+      const { prompt } = await capturePrompt();
+
+      expect(prompt).toContain(`soft_min = max(4, int(q['judged_n'] * 0.03))`);
+      expect(prompt).toContain(`if not fatal and (q['off_n'] >= soft_min or q['clustered_n'] >= 4):`);
+      expect(prompt).not.toContain('off_n >= 2');
+      // The fatal thresholds are a separate judgement and stay exactly where they were.
+      expect(prompt).toContain(`if q['judged_n'] >= 8 and q['agree'] < 0.75:`);
+      expect(prompt).toContain(`if q['unconv_px'] > max(256, 0.005 * q['opaque_px']):`);
+    });
+
+    /**
+     * A percentage alone trades one blind spot for another: three percent of a 900-tile
+     * silhouette is 27, so a small gap painted over as subject would ship. What separates a
+     * real hole from redraw noise is not how many tiles disagree but whether they touch — a
+     * hole is a patch, noise is scattered — and that reading does not change with the size
+     * of the picture, so it runs alongside the percentage rather than replacing it.
+     */
+    it('catches a contiguous patch of odd tiles however large the silhouette', async () => {
+      const { prompt } = await capturePrompt();
+
+      // Neighbour count over the 3x3, padded so opposite edges of the frame are not adjacent.
+      expect(prompt).toContain('p = np.pad(o, 1)');
+      expect(prompt).toContain(`clustered = off & (nb >= 3)`);
+      expect(prompt).toContain(`'clustered': clustered`);
+      // The reported location is the patch when there is one, so the retry hint names the gap
+      // rather than every stray tile in the frame.
+      expect(prompt).toContain(`at = q['clustered'] if q['clustered_n'] else q['off']`);
+      expect(prompt).toContain('in a contiguous patch%s');
+    });
+
+    /**
+     * The white frame is measured against input.png and the black frame is an edit of it, so a
+     * fault only the black call can have caused leaves a frame that already passed. Redrawing
+     * it spends a 2K generation for a fresh chance at a different failure.
+     */
+    it('redraws only the frame that was at fault', async () => {
+      const { prompt } = await capturePrompt();
+
+      // The unconverted-patch check is the one that indicts the black call alone.
+      expect(prompt).toContain(`regen.add('black')`);
+      expect(prompt).toContain(`json.dump(sorted(regen) or ['white', 'black'], open(D + '/plan.json', 'w'))`);
+      // STEP 2 reads the plan and keeps a frame it was not asked to draw again.
+      expect(prompt).toContain(`plan = set(json.load(open(D + '/plan.json')))`);
+      expect(prompt).toContain(`if 'white' in plan or not os.path.exists(D + '/white.png'):`);
+      // A frame being kept is copied, not moved: the next black call edits it in place.
+      expect(prompt).toContain(`(os.replace if name in regen else shutil.copyfile)`);
+      // Missing plan.json — the first attempt — still draws both.
+      expect(prompt).toContain(`plan = {'white', 'black'}`);
+    });
+
+    /**
+     * The A2A stream dies at 126 seconds and the turn runs for minutes, so the agent's account
+     * of a failure reaches nobody: the browser polls a job row, and all this side ever observes
+     * is that no upload arrived. Four failures in one batch were reported as an expired wait.
+     */
+    it('gives a turn with nothing to upload a way to say why', async () => {
+      const { prompt, jobId } = await capturePrompt();
+
+      expect(prompt).toContain(`/api/job/${jobId}/note`);
+      expect(prompt).toContain(`--data-binary @${workDirFor(jobId)}/failure.txt`);
+      // STEP 3 writes the file itself, so the reason is the script's words, not a paraphrase.
+      expect(prompt).toContain(`open(D + '/failure.txt', 'w').write(`);
+      // A delivered cutout must never be contradicted by a failure note on top of it.
+      expect(prompt).toContain('Never run STEP 5 for a job you uploaded');
     });
 
     it('carries no chroma-key machinery any more', async () => {

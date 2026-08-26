@@ -15,6 +15,7 @@
  *   POST   /api/agents/:agentId/chat        admin  one chat turn (text/event-stream)
  *   POST   /api/remove-bg                   open   background removal (202 on the agent path)
  *   PUT    /api/job/:jobId/output           ticket the agent uploads its cutout here
+ *   POST   /api/job/:jobId/note             ticket the agent reports having nothing to upload
  *   GET    /api/job/:jobId/status           open   poll a 202'd job: status + agent's note
  *
  * "admin" routes require the x-admin-password header — but only when the
@@ -40,6 +41,7 @@ import {
 import { getConversation, handleChatTurn, resetConversation } from './chat';
 import { assertUsableCutoutBytes, handleRemoveBg, type RemoveBgRequest } from './remove-bg';
 import {
+  MAX_NOTE_CHARS,
   MAX_OUTPUT_BYTES,
   consumeJobTicket,
   getJobNote,
@@ -48,17 +50,25 @@ import {
   jobIdFromInputKey,
   markInputFetched,
   outputKeyFor,
+  setJobNote,
   verifyJobTicket,
 } from './job';
 import { loadAppSettings, saveAppSettings } from './settings-manager';
 
 const SERVICE = 'cloudflare-worker-starter';
 
+/** Upper bound on a posted failure note before it is refused outright, rather than truncated. */
+const MAX_NOTE_BODY_CHARS = 64 * 1024;
+
 const app = new Hono<{ Bindings: Env }>();
 
-/** PUT /api/job/:jobId/output — the agent's upload leg, authorized by its ticket instead. */
-const isJobUpload = (method: string, path: string): boolean =>
-  method === 'PUT' && /^\/api\/job\/[a-f0-9]{32}\/output$/.test(path);
+/**
+ * The two routes the agent itself calls — its cutout, or its reason for not having one.
+ * Both are authorized by the job ticket rather than by the admin password or an Origin.
+ */
+const isAgentJobLeg = (method: string, path: string): boolean =>
+  (method === 'PUT' && /^\/api\/job\/[a-f0-9]{32}\/output$/.test(path)) ||
+  (method === 'POST' && /^\/api\/job\/[a-f0-9]{32}\/note$/.test(path));
 
 /** GET /api/job/:jobId/status — public for the same reason /api/remove-bg is. */
 const isJobStatus = (method: string, path: string): boolean =>
@@ -92,10 +102,10 @@ app.use('/api/*', async (c, next) => {
 // POSTs, so this shuts down CSRF without cookies or tokens.
 app.use('/api/*', async (c, next) => {
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(c.req.method)) {
-    // The job upload is exempt: the uploader is an agent running curl, not a browser, so it
-    // has no Origin to send. CSRF is about ambient credentials being replayed by a browser,
-    // and this route has none — it is authorized solely by an unguessable single-use ticket.
-    if (isJobUpload(c.req.method, new URL(c.req.url).pathname)) {
+    // The agent's own legs are exempt: the caller is an agent running curl, not a browser, so
+    // it has no Origin to send. CSRF is about ambient credentials being replayed by a browser,
+    // and these routes have none — they are authorized solely by an unguessable job ticket.
+    if (isAgentJobLeg(c.req.method, new URL(c.req.url).pathname)) {
       return next();
     }
     const origin = c.req.header('origin');
@@ -120,7 +130,7 @@ const adminHeaderOk = (c: { env: Env; req: { header: (name: string) => string | 
   return safeEqual(c.req.header('x-admin-password') ?? '', required);
 };
 
-// Everything except /api/health, /api/state, /api/remove-bg, the job upload, and
+// Everything except /api/health, /api/state, /api/remove-bg, the agent's own job legs, and
 // GET /api/r2/* image fetching needs the password (when one is set).
 app.use('/api/*', async (c, next) => {
   const path = new URL(c.req.url).pathname;
@@ -129,7 +139,7 @@ app.use('/api/*', async (c, next) => {
     path !== '/api/health' &&
     path !== '/api/state' &&
     path !== '/api/remove-bg' &&
-    !isJobUpload(c.req.method, path) &&
+    !isAgentJobLeg(c.req.method, path) &&
     !isJobStatus(c.req.method, path) &&
     !isPublicR2Image &&
     !adminHeaderOk(c)
@@ -320,6 +330,47 @@ app.put('/api/job/:jobId/output', async (c) => {
     customMetadata: { label: 'agent cutout', createdAt: new Date().toISOString() },
   });
   return c.json({ ok: true, bytes: bytes.byteLength });
+});
+
+/**
+ * POST /api/job/:jobId/note — the agent's other leg: why there is nothing to upload.
+ *
+ * The turn runs in `waitUntil` after a 202, and the A2A stream it runs under dies at 126
+ * seconds while the turn itself runs for minutes. Whatever the agent finally says therefore
+ * reaches nobody: the browser is polling a job row, and all this side can observe is that no
+ * upload arrived. Four failures in one batch were reported to the user as an expired wait,
+ * with the agent's actual reasons — three rejected attempts, an unconverted patch, a model
+ * call that returned no image — visible only in a sandbox nobody was looking at.
+ *
+ * So the failure gets the same treatment as the result: its own plain HTTPS request, on the
+ * same ticket, independent of the stream and of whether `waitUntil` survived. The ticket is
+ * deliberately *not* spent — a job that reports a failure and then recovers may still upload,
+ * and `status` beats `note` when it does.
+ */
+app.post('/api/job/:jobId/note', async (c) => {
+  const jobId = c.req.param('jobId');
+  await verifyJobTicket(c.env, jobId, c.req.header('x-job-token') ?? '');
+
+  // Generous next to a 2000-char note, small enough that a runaway transcript is refused
+  // rather than stored. content-length is the sender's claim and curl does not always make
+  // one, so the length of what actually arrived is the check that counts — the header is
+  // only a cheap early out, exactly as on the upload route.
+  const declared = Number(c.req.header('content-length') ?? '0');
+  if (declared > MAX_NOTE_BODY_CHARS) {
+    throw new HttpError(413, 'note_too_large', 'Failure note exceeds the maximum size.');
+  }
+  const text = (await c.req.text()).trim();
+  if (!text) {
+    throw new HttpError(400, 'empty_note', 'Failure note was empty.');
+  }
+  if (text.length > MAX_NOTE_BODY_CHARS) {
+    throw new HttpError(413, 'note_too_large', 'Failure note exceeds the maximum size.');
+  }
+
+  // Truncated, not refused: a reason too long to store is still a reason, and losing it
+  // would put the job straight back to being reported as an unexplained expired wait.
+  await setJobNote(c.env, jobId, 'failed', text.slice(0, MAX_NOTE_CHARS));
+  return c.json({ ok: true });
 });
 
 /**
