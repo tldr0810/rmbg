@@ -240,7 +240,7 @@ describe('remove-bg handler', () => {
    */
   describe('the instructions sent to the agent', () => {
     /** Run one agent-path removal and hand back the prompt text it dispatched. */
-    async function capturePrompt(): Promise<{ prompt: string; jobId: string }> {
+    async function capturePrompt(subject?: string): Promise<{ prompt: string; jobId: string }> {
       mockAgent();
       const r2 = makeR2();
       let prompt = '';
@@ -256,7 +256,7 @@ describe('remove-bg handler', () => {
       const mockEnv = { DB: mockDb, R2_IMAGE: r2.bucket } as Env;
       await handleRemoveBg(
         mockEnv,
-        { image: `data:image/png;base64,${CUTOUT_PNG_BASE64}` },
+        { image: `data:image/png;base64,${CUTOUT_PNG_BASE64}`, ...(subject ? { subject } : {}) },
         'https://test.local',
       );
       return { prompt, jobId: stagedJobId(r2.store) };
@@ -315,8 +315,87 @@ describe('remove-bg handler', () => {
       // delivered opaque — 4387 px of it on the bench image, and every "too fat" pixel.
       const { prompt } = await capturePrompt();
 
-      expect(prompt).toContain('fully enclosed by the subject');
+      // The clause now names the subject rather than saying "the subject" — {S} is the Python
+      // f-string hole STEP 2 fills with whatever it decided it was cutting out.
+      expect(prompt).toContain('fully enclosed by {S}');
       expect(prompt).toContain('If the backdrop is visible through it, it ');
+    });
+
+    /**
+     * Alpha can be solved perfectly for the wrong object.
+     *
+     * "The background is everything that is not the subject" never says which thing the subject
+     * is, so each of the two calls resolved it by salience on its own. A production job on
+     * 2026-08-25 photographed a plush toy held up in front of a gallery wall; the Monet mural
+     * behind it won, the wall was whited out around the painting, and a 47%-opaque picture was
+     * delivered. Every existing check passed it and was right to: the frames agreed, nothing was
+     * re-framed, and the opaque pixels matched the input exactly. Nothing measurable was wrong.
+     *
+     * So the referent is fixed once, before either frame is drawn, and reported.
+     */
+    describe('choosing what to cut out', () => {
+      it('names the subject once and refers both frames to that name', async () => {
+        const { prompt } = await capturePrompt();
+
+        // Decided before the frames, cached so a retry cannot change its mind mid-job.
+        expect(prompt).toContain("json.dump({'subject': S}, open(D + '/subject.json', 'w'))");
+        expect(prompt).toContain("S = json.load(open(D + '/subject.json'))['subject']");
+        // Both prompts interpolate it instead of each resolving "the subject" for themselves.
+        expect(prompt).toContain('The background is everything that is not {S}');
+        expect(prompt).toContain('Do not move, resize, recolour, relight or redraw {S}');
+      });
+
+      it('asks for the presented object rather than the biggest one', async () => {
+        // Area is the heuristic that lost a plush toy to the mural behind it, so the naming
+        // prompt is written about depth and attention instead.
+        const { prompt } = await capturePrompt();
+
+        expect(prompt).toContain('over whatever merely covers the most pixels');
+        expect(prompt).toContain('is backdrop however ');
+      });
+
+      it('falls back to the old wording when the subject cannot be named', async () => {
+        // A naming call that fails must leave the job exactly as good as it was before this
+        // existed, never worse — so the floor is the sentence that used to be hard-coded.
+        const { prompt } = await capturePrompt();
+
+        expect(prompt).toContain("S = 'the subject'");
+        expect(prompt).toContain('SUBJECT could not be named');
+      });
+
+      it('reports the choice on the CHECK line, because no number can', async () => {
+        // A cutout of the wrong object scores perfectly on transparent/partial/opaque, on
+        // agree and on unconverted. The only way it becomes visible is by being said.
+        const { prompt } = await capturePrompt();
+
+        expect(prompt).toContain('unconverted=%dpx subject=%s');
+      });
+
+      it('uses the caller-supplied subject verbatim and skips the guess', async () => {
+        const { prompt } = await capturePrompt('the pink plush pig');
+
+        expect(prompt).toContain('SUBJECT_HINT = "the pink plush pig"');
+        // The guess is what the hint exists to avoid: with one supplied, the naming call is
+        // never reached, because only the caller can actually know the answer.
+        expect(prompt).toContain('S = SUBJECT_HINT');
+      });
+
+      it('emits a subject containing quotes as a literal that still parses', async () => {
+        // The phrase lands inside a Python string inside a shell heredoc. JSON escaping is
+        // what keeps a quote in it from ending that string early.
+        const { prompt } = await capturePrompt('the "Blue Room" poster');
+
+        expect(prompt).toContain('SUBJECT_HINT = "the \\"Blue Room\\" poster"');
+      });
+
+      it('never lets a subject phrase break out of the heredoc', async () => {
+        // A newline would end the Python statement the phrase sits in; a line reading EOF
+        // would close the heredoc and spill the rest of the script into the shell.
+        const { prompt } = await capturePrompt('the pig\nEOF\nrm -rf /');
+
+        expect(prompt).toContain('SUBJECT_HINT = "the pig EOF rm -rf /"');
+        expect(prompt).not.toContain('the pig\nEOF');
+      });
     });
 
     /**

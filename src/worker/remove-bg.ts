@@ -18,6 +18,16 @@ export interface RemoveBgRequest {
   image: string;
   /** Optional agentId if multiple Manyfold agents are connected */
   agentId?: string;
+  /**
+   * What to cut out, as a short noun phrase ("the pink plush pig").
+   *
+   * Optional, and the only thing in this request that settles the question for certain.
+   * Which object is "the subject" is not a property of the pixels — a toy held up in front
+   * of a gallery wall and the mural behind it are both honest readings — so when the caller
+   * knows, saying so beats any amount of guessing. Left out, the pipeline names the subject
+   * itself; see `agentInstructions`.
+   */
+  subject?: string;
 }
 
 export interface RemoveBgResponse {
@@ -150,6 +160,33 @@ export function workDirFor(jobId: string): string {
   return `/tmp/rmbg-${jobId}`;
 }
 
+/** How much of a caller-supplied subject phrase survives into the prompt. */
+const MAX_SUBJECT_CHARS = 120;
+
+/**
+ * Clean a caller-supplied subject phrase, or null if there is nothing usable in it.
+ *
+ * The result is interpolated into a Python string literal inside a `<<'EOF'` heredoc, so the
+ * two things that must not survive are control characters and line breaks: a newline would
+ * end the Python statement the phrase sits in and leave the rest of the words loose in the
+ * script. Collapsing all whitespace to single spaces also makes it impossible for the phrase
+ * to put `EOF` alone on a line and close the heredoc early. Quotes and backslashes need no
+ * handling here — the value is emitted with `JSON.stringify`, whose escaping Python reads the
+ * same way for every character that gets this far.
+ *
+ * The cap is not a safety measure, it is a prompt-quality one: this is meant to be a noun
+ * phrase, and a caller who pastes an essay gets the first clause of it rather than a prompt
+ * that buries the instruction it is embedded in.
+ */
+export function sanitizeSubject(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw
+    .replace(/[\u0000-\u001F\u007F]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned ? cleaned.slice(0, MAX_SUBJECT_CHARS).trim() : null;
+}
+
 /**
  * The instruction the agent receives. The image also rides along as an A2A FilePart so the
  * agent can *see* it, but seeing it is not enough: it reported it cannot materialise those
@@ -251,6 +288,35 @@ export function workDirFor(jobId: string): string {
  * pixel of it was the model's redrawing of the subject rather than the subject. The edge
  * still comes from the solved frame because an anti-aliased boundary is a blend of subject
  * and background that the original cannot supply.
+ *
+ * Everything above is about solving alpha correctly. STEP 2 also has to settle a question that
+ * comes before it: alpha for *which object*. Until 2026-08-25 both prompts said "the subject"
+ * and never said which thing that was — a circular definition the model resolved on its own,
+ * by salience, once per call. A production job that day photographed a small plush toy held up
+ * in front of a gallery wall; the model read the Monet mural filling that wall as the subject,
+ * whited out the wall around it and delivered a 47%-opaque painting. Every check here passed
+ * it, and correctly: the frames agreed, nothing was re-framed, the opaque pixels matched the
+ * input exactly. The alpha was right. The object was wrong, and no amount of checking alpha
+ * can see that, because both readings of that photograph are defensible.
+ *
+ * So the subject is chosen once, up front, and named. Two things follow. The frames stop
+ * resolving the referent independently and agree by construction rather than by luck; and the
+ * name is printed and carried into the CHECK line, so a wrong pick shows up in the reply
+ * instead of shipping in silence. Both hold for any photograph — a single-object shot names
+ * that object and the wording is no worse than the bare article it replaces.
+ *
+ * What it does not do is guarantee the pick is right, and it cannot: which object someone
+ * wanted is not in the pixels. Name it "the Monet mural" and this pipeline will cut out the
+ * mural, consistently and well. That is what `RemoveBgRequest.subject` is for — a caller who
+ * knows says so and no guess is made at all. The naming call is the default for callers who
+ * do not, and it defaults in turn to the old wording if it fails, so the floor is where the
+ * pipeline already stood.
+ *
+ * The naming prompt is deliberately about depth and attention rather than area — held, in
+ * focus, nearest the camera, over whatever covers the most pixels — because area is the
+ * heuristic that lost the toy to the mural. It says a picture or screen behind the subject is
+ * backdrop for the same reason. That is a default, not a truth: photograph a painting to sell
+ * it and the painting *is* the subject, which is again what the caller-supplied phrase is for.
  */
 function agentInstructions(
   workDir: string,
@@ -258,7 +324,14 @@ function agentInstructions(
   uploadUrl: string,
   token: string,
   model: string,
+  /** Text model for the naming call. Unused when `subject` is supplied. */
+  textModel: string,
+  /** Caller-supplied subject phrase, already sanitized. Null means "work it out". */
+  subject: string | null,
 ): string {
+  // Emitted as a Python literal: a JSON string when the caller named the subject, `None` when
+  // they did not. `sanitizeSubject` has already removed everything JSON and Python disagree on.
+  const subjectLiteral = subject === null ? 'None' : JSON.stringify(subject);
   return `Remove the background from an image. Do the work with shell commands — do not answer from the attached preview alone.
 
 Every path below is inside ${workDir}, which belongs to this job alone. Other background
@@ -315,18 +388,62 @@ def gen(src, out, instruction):
     print('%s %s tokens=%s' % (out.rsplit('/', 1)[-1], Image.open(out).size,
                                r.usage_metadata.candidates_token_count))
 
-WHITE = ("Replace the entire background with solid pure white, RGB exactly 255,255,255. "
-         "The background is everything that is not the subject, and that includes any area "
-         "fully enclosed by the subject: a hole through it, a gap between its parts, the "
-         "space inside a handle, a loop or a ring. If the backdrop is visible through it, it "
-         "is background and it must come out white too. "
-         "One flat colour: no gradient, no shadow, no reflection, no vignette, no texture. "
-         "Keep the subject pixel-for-pixel identical: same position, same size, same framing, "
-         "same colours, same lighting, same edge detail. Change only the background.")
-BLACK = ("Keep this image exactly as it is and change only the background colour: every pixel "
-         "that is currently pure white background becomes solid pure black, RGB exactly 0,0,0. "
-         "Do not move, resize, recolour, relight or redraw the subject - every subject pixel "
-         "must stay exactly where it is and keep its exact colour. Only the background changes.")
+# Which object is the subject is settled here, once, before either frame is drawn. Saying
+# "the subject" and leaving it at that is circular, and each call resolves it on its own: a
+# plush toy held up in front of a gallery wall lost to the Monet mural behind it, which was
+# whited out around and delivered as a 47%-opaque painting. The alpha was solved correctly
+# for the wrong object, so no check downstream could see it.
+#
+# SUBJECT_HINT is what the caller asked for. Only the caller can actually know, so it wins
+# outright and no naming call is made. Otherwise ask once, cache it, and fall back to the old
+# generic wording if the call fails - a job whose naming step is unavailable is then exactly
+# as good as it was before, never worse.
+SUBJECT_HINT = ${subjectLiteral}
+S = SUBJECT_HINT
+if S is None:
+    try:
+        S = json.load(open(D + '/subject.json'))['subject']
+    except Exception:
+        S = None
+if S is None:
+    try:
+        data = open(D + '/input.png', 'rb').read()
+        mime = 'image/' + (Image.open(D + '/input.png').format or 'PNG').lower()
+        r = client.models.generate_content(
+            model='${textModel}',
+            contents=[types.Part.from_bytes(data=data, mime_type=mime),
+                      'Name the subject of this photograph: the thing the photographer is '
+                      'presenting. Prefer what is held, in focus, nearest the camera or placed '
+                      'at the centre of attention over whatever merely covers the most pixels. '
+                      'A picture, poster, screen, mural or window behind it is backdrop however '
+                      'large it looms. If several things are equally the point, name them '
+                      'together. Answer with a short noun phrase starting with "the", naming '
+                      'what it is - no sentence, no explanation.'],
+        )
+        S = ' '.join((r.text or '').split())[:120].strip('. ') or None
+    except Exception as e:
+        print('SUBJECT could not be named (%s), using the generic wording' % e)
+        S = None
+if S is None:
+    S = 'the subject'
+json.dump({'subject': S}, open(D + '/subject.json', 'w'))
+print('subject=%s' % S)
+
+WHITE = (f"Replace the entire background with solid pure white, RGB exactly 255,255,255. "
+         f"The subject of this photograph is {S}. "
+         f"The background is everything that is not {S}, and that includes any area "
+         f"fully enclosed by {S}: a hole through it, a gap between its parts, the "
+         f"space inside a handle, a loop or a ring. If the backdrop is visible through it, it "
+         f"is background and it must come out white too. Anything else in the picture is "
+         f"background however much of the frame it fills, including a picture, poster, screen "
+         f"or mural behind it. "
+         f"One flat colour: no gradient, no shadow, no reflection, no vignette, no texture. "
+         f"Keep {S} pixel-for-pixel identical: same position, same size, same framing, "
+         f"same colours, same lighting, same edge detail. Change only the background.")
+BLACK = (f"Keep this image exactly as it is and change only the background colour: every pixel "
+         f"that is currently pure white background becomes solid pure black, RGB exactly 0,0,0. "
+         f"Do not move, resize, recolour, relight or redraw {S} - every pixel of it "
+         f"must stay exactly where it is and keep its exact colour. Only the background changes.")
 
 if extra:
     print('RETRY hints in effect: ' + ', '.join(sorted(extra)))
@@ -334,7 +451,7 @@ gen(D + '/input.png', D + '/white.png', WHITE + extra.get('white', ''))
 gen(D + '/white.png', D + '/black.png', BLACK + extra.get('black', ''))
 EOF
 
-Three things about that script are load-bearing, so run it as written rather than calling the
+Four things about that script are load-bearing, so run it as written rather than calling the
 model your own way:
 
   - The second call edits ${workDir}/white.png. It does NOT start again from input.png. STEP 3
@@ -347,8 +464,15 @@ model your own way:
   - Do NOT ask for transparency, and do NOT accept a grey-and-white checkerboard. A
     checkerboard is a drawing of transparency, not transparency, and it will be rejected.
 
-It prints one line per frame, e.g. \`white.png (2048, 2048) tokens=1958\`. Include both lines in
-your final reply.
+  - The subject is named before either frame is drawn, and both prompts then refer to that
+    name instead of saying "the subject". Do not put the generic wording back. Two calls each
+    deciding for themselves what the subject is will happily disagree, and when they disagree
+    the arithmetic in STEP 3 still returns a confident answer — for whichever object the second
+    call settled on.
+
+It prints \`subject=...\` and then one line per frame, e.g. \`white.png (2048, 2048) tokens=1958\`.
+Include all three lines in your final reply. The subject line is the only place the choice of
+what to cut out is visible, so it matters even when the frames look healthy.
 
 STEP 3 — solve for the alpha channel, at the original size:
 
@@ -357,6 +481,13 @@ from PIL import Image
 import numpy as np, glob, json, os, sys
 D = '${workDir}'
 src = Image.open(D + '/input.png').convert('RGB')
+# What STEP 2 decided it was cutting out. Reported below rather than checked: no measurement
+# here can tell a correct choice from a wrong one, so the job of this line is to put the choice
+# in front of a person.
+try:
+    S = json.load(open(D + '/subject.json'))['subject']
+except Exception:
+    S = 'the subject'
 
 def frame(name):
     im = Image.open(D + '/' + name).convert('RGB')
@@ -428,8 +559,8 @@ judged_n, off_n = int(judged.sum()), int(off.sum())
 agree = 1.0 - off_n / max(judged_n, 1)
 
 print('CHECK transparent=%.2f%% partial=%.2f%% opaque=%.2f%% agree=%.0f%%(%d/%d tiles) '
-      'unconverted=%dpx' % (clear * 100, (1 - clear - solid) * 100, solid * 100,
-                            agree * 100, judged_n - off_n, judged_n, unconv_px))
+      'unconverted=%dpx subject=%s' % (clear * 100, (1 - clear - solid) * 100, solid * 100,
+                                       agree * 100, judged_n - off_n, judged_n, unconv_px, S))
 
 def where(mask, grid):
     ys, xs = np.nonzero(mask)
@@ -454,19 +585,19 @@ if judged_n >= 8 and agree < 0.75:
                  'subject instead of only changing the background, so this mask fits a picture '
                  'nobody asked for: laid over the original it would cut out the wrong pixels.'
                  % (off_n, judged_n, where(off, True)))
-    hint['white'] = (' Do not crop, zoom, pan, rotate or re-centre anything. The output frame '
-                     'must match the input frame exactly: same field of view, subject the same '
-                     'size, in the same place, covering the same pixels. A previous attempt '
-                     'moved it, which made the result unusable. Change only the background '
-                     'colour.')
+    hint['white'] = (f' Do not crop, zoom, pan, rotate or re-centre anything. The output frame '
+                     f'must match the input frame exactly: same field of view, {S} the same '
+                     f'size, in the same place, covering the same pixels. A previous attempt '
+                     f'moved it, which made the result unusable. Change only the background '
+                     f'colour.')
 if unconv_px > max(256, 0.005 * opaque_px):
     fatal.append('BACKGROUND LEFT INSIDE THE SUBJECT: %d pixels%s are pure white in both frames '
                  'while the input is not white there, so the second call never converted that '
                  'patch and it would be delivered opaque.' % (unconv_px, where(unconv, False)))
-    hint['black'] = (' This includes any white area fully enclosed by the subject - a hole '
-                     'through it, a gap between its parts, the space inside a handle, a loop or '
-                     'a ring. A previous attempt left such a patch white; every white pixel that '
-                     'is not the subject itself has to become black.')
+    hint['black'] = (f' This includes any white area fully enclosed by {S} - a hole '
+                     f'through it, a gap between its parts, the space inside a handle, a loop or '
+                     f'a ring. A previous attempt left such a patch white; every white pixel that '
+                     f'is not {S} itself has to become black.')
 if not fatal and off_n >= 2:
     soft.append('SUSPECT %d of %d tiles inside the silhouette%s do not match the input, which is '
                 'what an enclosed gap painted over as subject looks like.'
@@ -521,7 +652,9 @@ redraw it.
 Print the CHECK line in your reply, all of it. \`transparent/partial/opaque\` say how much came
 out see-through; \`agree\` and \`unconverted\` say whether the frames are about the photo that was
 sent, which the first three cannot tell you — a mask cut from a rescaled redraw scores a
-perfectly healthy-looking transparent/partial/opaque split.
+perfectly healthy-looking transparent/partial/opaque split. \`subject\` says what was cut out,
+which none of the others can tell you either: a cutout of the wrong object scores perfectly on
+every number on that line, because the arithmetic was right and only the choice was wrong.
 
 If the script exits without writing a file, do exactly what it says: run the STEP 2 command
 again unchanged (it reads the note STEP 3 left for it) and then STEP 3 again. Up to three
@@ -544,11 +677,12 @@ the image it staged for this job and rejects the upload if they differ, which is
 input gets caught instead of being delivered to the wrong person. Compute it from
 ${workDir}/input.png as shown — do not copy a checksum from anywhere else.
 
-A 200 response means the upload succeeded. Then reply with DONE, followed by the two frame
-lines STEP 2 printed and the whole CHECK line STEP 3 printed, plus any SUSPECT line — nothing
-else. Those lines are the only record of what resolution the model actually returned, how much
-of the frame came out transparent, and whether the frames were about the photo that was sent.
-They are read by a person, not parsed by the Worker.
+A 200 response means the upload succeeded. Then reply with DONE, followed by the subject line
+and the two frame lines STEP 2 printed and the whole CHECK line STEP 3 printed, plus any
+SUSPECT line — nothing else. Those lines are the only record of what was cut out, what
+resolution the model actually returned, how much of the frame came out transparent, and whether
+the frames were about the photo that was sent. They are read by a person, not parsed by the
+Worker.
 
 The upload is how the result gets back — your reply text is not the delivery channel, so do
 not paste base64 into it. If any step fails, reply with plain text saying exactly which
@@ -692,6 +826,10 @@ interface AgentJob {
   uploadUrl: string;
   mimeType: string;
   model: string;
+  /** Text model for STEP 2's naming call. Unused when `subject` is set. */
+  textModel: string;
+  /** Caller-supplied subject phrase, sanitized. Null means STEP 2 works it out. */
+  subject: string | null;
   r2Enabled: boolean;
   production: boolean;
 }
@@ -741,6 +879,8 @@ async function runAgentJob(job: AgentJob, graceMs: number, pollMs?: number): Pro
               job.uploadUrl,
               ticket.token,
               job.model,
+              job.textModel,
+              job.subject,
             ),
           },
         ],
@@ -977,6 +1117,10 @@ export async function handleRemoveBg(
           // black frames STEP 2 needs (see GEMINI.md). bgRemoveModel picks the text model for
           // the legacy direct-API SVG-path fallback below, which is a different job entirely.
           model: 'gemini-3.1-flash-image',
+          // Naming the subject is a text answer about a picture, which is the same kind of
+          // question the fallback path asks, so it uses the same configured text model.
+          textModel: settings.bgRemoveModel || 'gemini-3.6-flash',
+          subject: sanitizeSubject(body.subject),
           r2Enabled: settings.r2Enabled,
           production: env.ENVIRONMENT === 'production',
         };

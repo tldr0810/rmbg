@@ -236,6 +236,10 @@ app.post('/api/agents/:agentId/chat', async (c) => {
  * for is only the acknowledgement. Poll `statusUrl` for the rest.
  *
  * The direct-Gemini fallback has no such problem and still answers 200 with the image.
+ *
+ * An optional `subject` ("the pink plush pig") names what to cut out. Worth sending whenever
+ * the caller knows: which object is the subject cannot be recovered from the image, so left
+ * out it is guessed, and a photo with a second plausible subject in it can be guessed wrong.
  */
 app.post('/api/remove-bg', async (c) => {
   const body = (await c.req.json().catch(() => null)) as RemoveBgRequest | null;
