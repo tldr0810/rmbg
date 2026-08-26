@@ -178,6 +178,14 @@ const MAX_SUBJECT_CHARS = 120;
  * The cap is not a safety measure, it is a prompt-quality one: this is meant to be a noun
  * phrase, and a caller who pastes an essay gets the first clause of it rather than a prompt
  * that buries the instruction it is embedded in.
+ *
+ * An unpaired surrogate is dropped last, after the cap, because both the caller and the cap can
+ * produce one: JSON permits a lone `\ud800` escape, and slicing at a fixed number of UTF-16 units
+ * splits an emoji that straddles the limit. Neither JSON.stringify nor Python objects to one — it
+ * survives all the way to the generation call, where encoding the prompt as UTF-8 raises and kills
+ * STEP 2 outright, since a caller-supplied subject skips the naming call's try/except. Under /u,
+ * `\p{Surrogate}` matches only the unpaired ones: a well-formed pair is a single code point
+ * outside the category, so emoji come through intact.
  */
 export function sanitizeSubject(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
@@ -185,7 +193,9 @@ export function sanitizeSubject(raw: unknown): string | null {
     .replace(/[\u0000-\u001F\u007F]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  return cleaned ? cleaned.slice(0, MAX_SUBJECT_CHARS).trim() : null;
+  if (!cleaned) return null;
+  const capped = cleaned.slice(0, MAX_SUBJECT_CHARS).replace(/\p{Surrogate}/gu, '').trim();
+  return capped || null;
 }
 
 /**

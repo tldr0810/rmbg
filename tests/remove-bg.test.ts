@@ -3,6 +3,7 @@ import {
   assertUsableCutout,
   handleRemoveBg,
   pngDimensions,
+  sanitizeSubject,
   workDirFor,
 } from '../src/worker/remove-bg';
 import { INPUT_DIGEST_METADATA, sha256Hex } from '../src/worker/job';
@@ -395,6 +396,28 @@ describe('remove-bg handler', () => {
 
         expect(prompt).toContain('SUBJECT_HINT = "the pig EOF rm -rf /"');
         expect(prompt).not.toContain('the pig\nEOF');
+      });
+
+      /**
+       * JSON permits a lone `\ud800` escape and neither JSON.stringify nor Python objects to
+       * one, so it rides all the way to the generation call and raises there while encoding the
+       * prompt as UTF-8 — killing STEP 2, because a supplied subject skips the naming call's
+       * try/except. The cap makes one of its own accord too, by slicing through an emoji that
+       * straddles the limit.
+       */
+      it('drops an unpaired surrogate while keeping whole emoji', async () => {
+        expect(sanitizeSubject('the \ud800 pig')).toBe('the  pig');
+        expect(sanitizeSubject('\udc00')).toBeNull();
+        expect(sanitizeSubject('the 🐷 pig')).toBe('the 🐷 pig');
+
+        // 🐷 is two UTF-16 units, so at 119 characters the cap lands between them.
+        const straddling = 'x'.repeat(119) + '🐷';
+        const capped = sanitizeSubject(straddling);
+        expect(capped).toBe('x'.repeat(119));
+        expect(JSON.parse(JSON.stringify(capped))).toBe(capped);
+
+        const { prompt } = await capturePrompt('the \ud800 pig');
+        expect(prompt).not.toMatch(/[\uD800-\uDFFF]/u);
       });
     });
 
